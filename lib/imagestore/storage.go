@@ -123,6 +123,17 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 				}
 				continue
 			}
+			if existing := deltasBkt.Get(tileKey); existing != nil {
+				dedupMatch++
+				storedImage.TileRefs[i] = TileRef{
+					X:           tileRefs[i].X,
+					Y:           tileRefs[i].Y,
+					TileID:      tileRefs[i].TileID,
+					IsDelta:     false,
+					StorageType: StorageDuplicate,
+				}
+				continue
+			}
 
 			// Check if we have any tiles at all for similarity matching
 			if s.similarityMatcher.Size() == 0 {
