@@ -39,16 +39,16 @@ func (h *ImageHandler) handleImages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing image ID", http.StatusBadRequest)
 		return
 	}
-	
+
 	imageID := path
-	
+
 	switch r.Method {
 	case http.MethodPost:
 		h.storeImage(w, r, imageID)
 	case http.MethodGet:
-		h.retrieveImage(w, r, imageID)
+		h.retrieveImage(w, imageID)
 	case http.MethodDelete:
-		h.deleteImage(w, r, imageID)
+		h.deleteImage(w, imageID)
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -62,14 +62,14 @@ func (h *ImageHandler) handleImagesList(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	imageIDs, err := h.store.ListImages()
 	if err != nil {
 		log.Printf("Error listing images: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"images": imageIDs,
@@ -85,7 +85,7 @@ func (h *ImageHandler) storeImage(w http.ResponseWriter, r *http.Request, imageI
 		http.Error(w, "Failed to parse form", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Get file from form
 	file, fileHeader, err := r.FormFile("image")
 	if err != nil {
@@ -93,14 +93,14 @@ func (h *ImageHandler) storeImage(w http.ResponseWriter, r *http.Request, imageI
 		return
 	}
 	defer file.Close()
-	
+
 	// Validate file type
 	contentType := fileHeader.Header.Get("Content-Type")
 	if !isValidImageType(contentType) {
 		http.Error(w, "Invalid image type. Supported: PNG, JPEG", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Read file data
 	imageData, err := io.ReadAll(file)
 	if err != nil {
@@ -108,13 +108,13 @@ func (h *ImageHandler) storeImage(w http.ResponseWriter, r *http.Request, imageI
 		http.Error(w, "Failed to read image", http.StatusInternalServerError)
 		return
 	}
-	
+
 	// Validate file size
 	if len(imageData) > 50<<20 { // 50MB max
 		http.Error(w, "Image too large (max 50MB)", http.StatusRequestEntityTooLarge)
 		return
 	}
-	
+
 	// Store image
 	err = h.store.StoreImage(imageID, imageData)
 	if err != nil {
@@ -122,7 +122,7 @@ func (h *ImageHandler) storeImage(w http.ResponseWriter, r *http.Request, imageI
 		http.Error(w, "Failed to store image", http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{
@@ -133,7 +133,7 @@ func (h *ImageHandler) storeImage(w http.ResponseWriter, r *http.Request, imageI
 }
 
 // retrieveImage handles GET /images/{id}
-func (h *ImageHandler) retrieveImage(w http.ResponseWriter, r *http.Request, imageID string) {
+func (h *ImageHandler) retrieveImage(w http.ResponseWriter, imageID string) {
 	imageData, err := h.store.RetrieveImage(imageID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -144,14 +144,14 @@ func (h *ImageHandler) retrieveImage(w http.ResponseWriter, r *http.Request, ima
 		http.Error(w, "Failed to retrieve image", http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s.png\"", imageID))
 	w.Write(imageData)
 }
 
 // deleteImage handles DELETE /images/{id}
-func (h *ImageHandler) deleteImage(w http.ResponseWriter, r *http.Request, imageID string) {
+func (h *ImageHandler) deleteImage(w http.ResponseWriter, imageID string) {
 	err := h.store.DeleteImage(imageID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -162,7 +162,7 @@ func (h *ImageHandler) deleteImage(w http.ResponseWriter, r *http.Request, image
 		http.Error(w, "Failed to delete image", http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":   "success",
@@ -178,9 +178,9 @@ func (h *ImageHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	stats := h.store.GetStorageStats()
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
 }
@@ -192,10 +192,10 @@ func (h *ImageHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "healthy",
+		"status":  "healthy",
 		"service": "imageencoder",
 	})
 }
@@ -216,12 +216,12 @@ func CORSMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		
+
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		
+
 		next.ServeHTTP(w, r)
 	})
 }
