@@ -241,22 +241,18 @@ func ComputeFeatureDistance(f1, f2 *TileFeatures) float64 {
 	return distance
 }
 
-// BestMatchWithPixelCheck finds the best match and verifies with actual pixel comparison
-func (sm *SimilarityMatcher) BestMatchWithPixelCheck(tileData []byte, tileSize int, featureThreshold, pixelThreshold float64, getTileData func(TileID) ([]byte, error)) (*TileID, float64, error) {
+func (sm *SimilarityMatcher) BestMatch(tileData []byte, tileSize int, getTileData func(TileID) ([]byte, error)) (*TileID, error) {
 	// First, find candidates using feature similarity
-	candidates, distances, err := sm.FindTopSimilarTiles(tileData, tileSize, 5) // Check top 5 candidates
+	candidates, _, err := sm.FindTopSimilarTiles(tileData, tileSize, 5) // Check top 5 candidates
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	bestTileID := ""
 	bestPixelDistance := math.Inf(1)
 
 	// Check pixel-level similarity for candidates
-	for i, candidateID := range candidates {
-		if distances[i] > featureThreshold {
-			break // Remaining candidates are too far in feature space
-		}
+	for _, candidateID := range candidates {
 
 		// Get candidate tile data
 		candidateData, err := getTileData(candidateID)
@@ -276,10 +272,10 @@ func (sm *SimilarityMatcher) BestMatchWithPixelCheck(tileData []byte, tileSize i
 		}
 	}
 
-	if bestPixelDistance <= pixelThreshold && bestTileID != "" {
+	if bestTileID != "" {
 		tileID := TileID(bestTileID)
-		return &tileID, bestPixelDistance, nil
+		return &tileID, nil
 	}
 
-	return nil, bestPixelDistance, nil
+	return nil, nil
 }

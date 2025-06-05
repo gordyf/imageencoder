@@ -72,6 +72,11 @@ func NewBoltImageStore(config *Config) (*BoltImageStore, error) {
 
 // StoreImage stores an image using tile-based deduplication
 func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
+	dedupMatch := 0
+	directStore := 0
+	deltaStore := 0
+	noBestMatch := 0
+
 	// Convert image data to image.Image
 	img, err := decodeImageFromBytes(imageData)
 	if err != nil {
@@ -99,12 +104,15 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 		imagesBkt := tx.Bucket(imagesBucket)
 		featuresBkt := tx.Bucket(featuresBucket)
 
+		fmt.Println("considering ", len(tiles), "tiles for image", id)
+
 		// Process each tile
 		for i, tile := range tiles {
 			tileKey := []byte(tile.ID)
 
 			// Check if exact tile already exists (by hash)
 			if existing := tilesBkt.Get(tileKey); existing != nil {
+				dedupMatch++
 				// Tile already exists, just reference it
 				storedImage.TileRefs[i] = TileRef{
 					X:           tileRefs[i].X,
@@ -118,6 +126,7 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 
 			// Check if we have any tiles at all for similarity matching
 			if s.similarityMatcher.Size() == 0 {
+				directStore++
 				// No existing tiles, store this one directly
 				err := tilesBkt.Put(tileKey, tile.Data)
 				if err != nil {
@@ -145,53 +154,53 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 			}
 
 			// Find similar tile for delta encoding
-			bestMatch, pixelDistance, err := s.similarityMatcher.BestMatchWithPixelCheck(
+			bestMatch, err := s.similarityMatcher.BestMatch(
 				tile.Data,
 				s.config.TileSize,
-				0.15,                         // Feature threshold
-				s.config.SimilarityThreshold, // Pixel threshold
 				func(tileID TileID) ([]byte, error) {
 					return s.getTileDataFromTx(tx, tileID)
 				},
 			)
 
-			if err == nil && bestMatch != nil {
-				// Additional validation: ensure pixel distance is actually small enough
-				if pixelDistance <= s.config.SimilarityThreshold {
-					// Create delta
-					baseData, err := s.getTileDataFromTx(tx, *bestMatch)
-					if err == nil {
-						deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
-						if err == nil {
-							// Only use delta if it's significantly smaller (at least 25% savings)
-							deltaIsSmaller := len(deltaData) < (len(tile.Data) * 3 / 4)
-							// debug log if delta is not smaller
-							if !deltaIsSmaller {
-								log.Printf("Delta for tile %s is not smaller than original (%d vs %d bytes)", tile.ID, len(deltaData), len(tile.Data))
-							} else {
-								deltaKey := []byte(tile.ID)
-								tileDelta := CreateTileDelta(*bestMatch, deltaData)
+			if bestMatch == nil {
+				noBestMatch++
+			}
 
-								deltaBytes, err := json.Marshal(tileDelta)
+			if err == nil && bestMatch != nil {
+				// Create delta
+				baseData, err := s.getTileDataFromTx(tx, *bestMatch)
+				if err == nil {
+					deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
+					if err == nil {
+						// Only use delta if it's significantly smaller (at least 25% savings)
+						deltaIsSmaller := len(deltaData) < (len(tile.Data) * 3 / 4)
+						// debug log if delta is not smaller
+						if !deltaIsSmaller {
+							log.Printf("Delta for tile %s is not smaller than original (%d vs %d bytes)", tile.ID, len(deltaData), len(tile.Data))
+						} else {
+							deltaStore++
+							deltaKey := []byte(tile.ID)
+							tileDelta := CreateTileDelta(*bestMatch, deltaData)
+
+							deltaBytes, err := json.Marshal(tileDelta)
+							if err == nil {
+								err = deltasBkt.Put(deltaKey, deltaBytes)
 								if err == nil {
-									err = deltasBkt.Put(deltaKey, deltaBytes)
-									if err == nil {
-										storedImage.TileRefs[i] = TileRef{
-											X:           tileRefs[i].X,
-											Y:           tileRefs[i].Y,
-											TileID:      tile.ID,
-											IsDelta:     true,
-											StorageType: StorageDelta,
-										}
-										continue
+									storedImage.TileRefs[i] = TileRef{
+										X:           tileRefs[i].X,
+										Y:           tileRefs[i].Y,
+										TileID:      tile.ID,
+										IsDelta:     true,
+										StorageType: StorageDelta,
 									}
+									continue
 								}
 							}
 						}
 					}
 				}
 			}
-
+			directStore++
 			// Store as new tile
 			err = tilesBkt.Put(tileKey, tile.Data)
 			if err != nil {
@@ -222,7 +231,9 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal image metadata: %w", err)
 		}
-
+		fmt.Println("Deduplication matches found:", dedupMatch)
+		fmt.Println("Direct stores:", directStore, "Delta stores:", deltaStore)
+		fmt.Println("No best matches found:", noBestMatch)
 		return imagesBkt.Put([]byte(id), imageBytes)
 	})
 }
