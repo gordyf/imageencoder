@@ -2,11 +2,11 @@ package imagestore
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"math"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // ComputeDelta calculates the difference between two tiles
@@ -120,7 +120,7 @@ func EstimateDeltaSize(newTile, baseTile []byte, tileSize int) (int, error) {
 	return len(deltaData), nil
 }
 
-// compressDelta compresses delta data using gzip
+// compressDelta compresses delta data using zstd
 func compressDelta(delta []int8) ([]byte, error) {
 	var buf bytes.Buffer
 
@@ -129,23 +129,21 @@ func compressDelta(delta []int8) ([]byte, error) {
 		return nil, err
 	}
 
-	// Compress data
-	gzWriter := gzip.NewWriter(&buf)
-
-	// Convert int8 to bytes for writing
+	// Convert int8 to bytes for compression
 	deltaBytes := make([]byte, len(delta))
 	for i, d := range delta {
 		deltaBytes[i] = byte(d)
 	}
 
-	if _, err := gzWriter.Write(deltaBytes); err != nil {
-		gzWriter.Close()
+	// Compress data with zstd
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
 		return nil, err
 	}
+	defer encoder.Close()
 
-	if err := gzWriter.Close(); err != nil {
-		return nil, err
-	}
+	compressedData := encoder.EncodeAll(deltaBytes, make([]byte, 0, len(deltaBytes)))
+	buf.Write(compressedData)
 
 	return buf.Bytes(), nil
 }
@@ -160,14 +158,20 @@ func decompressDelta(compressed []byte) ([]int8, error) {
 		return nil, err
 	}
 
-	// Decompress data
-	gzReader, err := gzip.NewReader(buf)
+	// Read remaining compressed data
+	compressedData := make([]byte, buf.Len())
+	if _, err := buf.Read(compressedData); err != nil {
+		return nil, err
+	}
+
+	// Decompress data with zstd
+	decoder, err := zstd.NewReader(nil)
 	if err != nil {
 		return nil, err
 	}
-	defer gzReader.Close()
+	defer decoder.Close()
 
-	deltaBytes, err := io.ReadAll(gzReader)
+	deltaBytes, err := decoder.DecodeAll(compressedData, nil)
 	if err != nil {
 		return nil, err
 	}
