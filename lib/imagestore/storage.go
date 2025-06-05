@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"go.etcd.io/bbolt"
 )
 
@@ -24,6 +25,8 @@ type BoltImageStore struct {
 	db                *bbolt.DB
 	config            *Config
 	similarityMatcher *SimilarityMatcher
+	encoder           *zstd.Encoder
+	decoder           *zstd.Decoder
 }
 
 // NewBoltImageStore creates a new BoltDB-backed image store
@@ -55,10 +58,26 @@ func NewBoltImageStore(config *Config) (*BoltImageStore, error) {
 		return nil, err
 	}
 
+	// Create zstd encoder and decoder
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
+	}
+
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		db.Close()
+		encoder.Close()
+		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+	}
+
 	store := &BoltImageStore{
 		db:                db,
 		config:            config,
 		similarityMatcher: NewSimilarityMatcher(),
+		encoder:           encoder,
+		decoder:           decoder,
 	}
 
 	// Load existing features into similarity matcher
@@ -138,8 +157,12 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 			// Check if we have any tiles at all for similarity matching
 			if s.similarityMatcher.Size() == 0 {
 				directStore++
-				// No existing tiles, store this one directly
-				err := tilesBkt.Put(tileKey, tile.Data)
+				// No existing tiles, store this one directly (compressed)
+				compressedData, err := s.compressTileData(tile.Data)
+				if err != nil {
+					return fmt.Errorf("failed to compress tile %s: %w", tile.ID, err)
+				}
+				err = tilesBkt.Put(tileKey, compressedData)
 				if err != nil {
 					return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
 				}
@@ -212,8 +235,12 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 				}
 			}
 			directStore++
-			// Store as new tile
-			err = tilesBkt.Put(tileKey, tile.Data)
+			// Store as new tile (compressed)
+			compressedData, err := s.compressTileData(tile.Data)
+			if err != nil {
+				return fmt.Errorf("failed to compress tile %s: %w", tile.ID, err)
+			}
+			err = tilesBkt.Put(tileKey, compressedData)
 			if err != nil {
 				return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
 			}
@@ -365,7 +392,23 @@ func (s *BoltImageStore) GetStorageStats() StorageStats {
 
 // Close closes the database
 func (s *BoltImageStore) Close() error {
+	if s.encoder != nil {
+		s.encoder.Close()
+	}
+	if s.decoder != nil {
+		s.decoder.Close()
+	}
 	return s.db.Close()
+}
+
+// compressTileData compresses tile data using zstd
+func (s *BoltImageStore) compressTileData(data []byte) ([]byte, error) {
+	return s.encoder.EncodeAll(data, make([]byte, 0, len(data))), nil
+}
+
+// decompressTileData decompresses tile data using zstd
+func (s *BoltImageStore) decompressTileData(compressedData []byte) ([]byte, error) {
+	return s.decoder.DecodeAll(compressedData, nil)
 }
 
 // RetrieveDebugImage generates a color-coded debug visualization
@@ -462,10 +505,13 @@ func (s *BoltImageStore) getTileDataFromTx(tx *bbolt.Tx, tileID TileID) ([]byte,
 
 	// Try tiles bucket first
 	tilesBkt := tx.Bucket(tilesBucket)
-	if tileData := tilesBkt.Get(tileKey); tileData != nil {
-		result := make([]byte, len(tileData))
-		copy(result, tileData)
-		return result, nil
+	if compressedData := tilesBkt.Get(tileKey); compressedData != nil {
+		// Decompress the tile data
+		decompressedData, err := s.decompressTileData(compressedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress tile %s: %w", tileID, err)
+		}
+		return decompressedData, nil
 	}
 
 	// Try deltas bucket
