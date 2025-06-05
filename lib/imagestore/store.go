@@ -68,7 +68,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		TileSize:            256,
-		SimilarityThreshold: 0.1,
+		SimilarityThreshold: 0.05, // More conservative: 5% difference threshold
 		DatabasePath:        "./imagestore.db",
 	}
 }

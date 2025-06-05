@@ -7,7 +7,7 @@
   },
   "image_store": {
     "tile_size": 256,
-    "similarity_threshold": 0.1,
+    "similarity_threshold": 0.05,
     "database_path": "./imagestore.db"
   },
   "log_level": "info"

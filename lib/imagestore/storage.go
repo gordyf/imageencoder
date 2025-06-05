@@ -101,18 +101,40 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 		for i, tile := range tiles {
 			tileKey := []byte(tile.ID)
 
-			// Check if tile already exists
+			// Check if exact tile already exists (by hash)
 			if existing := tilesBkt.Get(tileKey); existing != nil {
 				// Tile already exists, just reference it
 				storedImage.TileRefs[i] = tileRefs[i]
 				continue
 			}
 
-			// Find similar tile for delta encoding
-			bestMatch, _, err := s.similarityMatcher.BestMatchWithPixelCheck(
+			// Check if we have any tiles at all for similarity matching
+			if s.similarityMatcher.Size() == 0 {
+				// No existing tiles, store this one directly
+				err := tilesBkt.Put(tileKey, tile.Data)
+				if err != nil {
+					return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
+				}
+				
+				// Store features
+				features, err := ExtractTileFeatures(tile.ID, tile.Data, s.config.TileSize)
+				if err == nil {
+					featuresBytes, err := json.Marshal(features)
+					if err == nil {
+						featuresBkt.Put(tileKey, featuresBytes)
+						s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
+					}
+				}
+				
+				storedImage.TileRefs[i] = tileRefs[i]
+				continue
+			}
+
+			// Find similar tile for delta encoding with stricter thresholds
+			bestMatch, pixelDistance, err := s.similarityMatcher.BestMatchWithPixelCheck(
 				tile.Data,
 				s.config.TileSize,
-				0.3, // Feature threshold
+				0.15, // Stricter feature threshold  
 				s.config.SimilarityThreshold,
 				func(tileID TileID) ([]byte, error) {
 					return s.getTileDataFromTx(tx, tileID)
@@ -120,27 +142,50 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 			)
 
 			if err == nil && bestMatch != nil {
-				// Create delta
-				baseData, err := s.getTileDataFromTx(tx, *bestMatch)
-				if err == nil {
-					deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
+				// Additional validation: ensure pixel distance is actually small enough
+				if pixelDistance <= s.config.SimilarityThreshold {
+					// Create delta
+					baseData, err := s.getTileDataFromTx(tx, *bestMatch)
 					if err == nil {
-						// Store as delta if it's smaller than the original tile
-						if len(deltaData) < len(tile.Data) {
-							deltaKey := []byte(tile.ID)
-							tileDelta := CreateTileDelta(*bestMatch, deltaData)
-
-							deltaBytes, err := json.Marshal(tileDelta)
-							if err == nil {
-								err = deltasBkt.Put(deltaKey, deltaBytes)
-								if err == nil {
-									storedImage.TileRefs[i] = TileRef{
-										X:       tileRefs[i].X,
-										Y:       tileRefs[i].Y,
-										TileID:  tile.ID,
-										IsDelta: true,
+						deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
+						if err == nil {
+							// Verify delta reconstruction matches original
+							reconstructed, verifyErr := ApplyDelta(baseData, deltaData, s.config.TileSize)
+							isReconstructionPerfect := false
+							if verifyErr == nil {
+								// Check if reconstruction is identical to original
+								isReconstructionPerfect = len(reconstructed) == len(tile.Data)
+								if isReconstructionPerfect {
+									for j := 0; j < len(tile.Data); j++ {
+										if reconstructed[j] != tile.Data[j] {
+											isReconstructionPerfect = false
+											break
+										}
 									}
-									continue
+								}
+							}
+							
+							// More conservative: only use delta if it's significantly smaller (at least 25% savings)
+							// pixel distance is very small, AND reconstruction is perfect
+							deltaIsSmaller := len(deltaData) < (len(tile.Data) * 3 / 4)
+							pixelDistanceIsVerySmall := pixelDistance < 0.05
+							
+							if deltaIsSmaller && pixelDistanceIsVerySmall && isReconstructionPerfect {
+								deltaKey := []byte(tile.ID)
+								tileDelta := CreateTileDelta(*bestMatch, deltaData)
+
+								deltaBytes, err := json.Marshal(tileDelta)
+								if err == nil {
+									err = deltasBkt.Put(deltaKey, deltaBytes)
+									if err == nil {
+										storedImage.TileRefs[i] = TileRef{
+											X:       tileRefs[i].X,
+											Y:       tileRefs[i].Y,
+											TileID:  tile.ID,
+											IsDelta: true,
+										}
+										continue
+									}
 								}
 							}
 						}
