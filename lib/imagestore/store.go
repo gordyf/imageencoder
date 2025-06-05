@@ -65,11 +65,17 @@ type TileRef struct {
 }
 
 type StorageStats struct {
-	TotalImages      int
-	UniqueTiles      int
-	TotalDeltas      int
-	StorageBytes     int64
-	CompressionRatio float64
+	TotalImages         int
+	TotalTiles          int
+	UniqueTiles         int
+	TotalDeltas         int
+	DirectTiles         int
+	DeduplicatedTiles   int
+	DirectPercent       float64
+	DeduplicatedPercent float64
+	StorageBytes        int64
+	OriginalBytes       int64
+	CompressionRatio    float64
 }
 
 type ImageStore interface {

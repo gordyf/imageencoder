@@ -357,23 +357,45 @@ func (s *BoltImageStore) GetStorageStats() StorageStats {
 	var stats StorageStats
 
 	s.db.View(func(tx *bbolt.Tx) error {
-		// Count images
 		imagesBkt := tx.Bucket(imagesBucket)
+		tilesBkt := tx.Bucket(tilesBucket)
+		deltasBkt := tx.Bucket(deltasBucket)
+
+		// Count images and analyze tile usage patterns
 		imagesBkt.ForEach(func(k, v []byte) error {
 			stats.TotalImages++
+
+			var storedImage StoredImage
+			err := json.Unmarshal(v, &storedImage)
+			if err == nil {
+				// Count tiles by storage type
+				for _, tileRef := range storedImage.TileRefs {
+					stats.TotalTiles++
+					switch tileRef.StorageType {
+					case StorageUnique:
+						stats.DirectTiles++
+					case StorageDuplicate:
+						stats.DeduplicatedTiles++
+					case StorageDelta:
+						stats.DeduplicatedTiles++
+					}
+				}
+
+				// Calculate original uncompressed size for this image
+				totalPixels := int64(storedImage.Width * storedImage.Height)
+				stats.OriginalBytes += totalPixels * 3 // 3 bytes per pixel (RGB)
+			}
 			return nil
 		})
 
-		// Count tiles
-		tilesBkt := tx.Bucket(tilesBucket)
+		// Count unique tiles and their storage size
 		tilesBkt.ForEach(func(k, v []byte) error {
 			stats.UniqueTiles++
 			stats.StorageBytes += int64(len(v))
 			return nil
 		})
 
-		// Count deltas
-		deltasBkt := tx.Bucket(deltasBucket)
+		// Count deltas and their storage size
 		deltasBkt.ForEach(func(k, v []byte) error {
 			stats.TotalDeltas++
 			stats.StorageBytes += int64(len(v))
@@ -383,12 +405,15 @@ func (s *BoltImageStore) GetStorageStats() StorageStats {
 		return nil
 	})
 
-	// Calculate compression ratio (simplified)
-	if stats.TotalImages > 0 {
-		expectedSize := int64(stats.TotalImages) * int64(s.config.TileSize*s.config.TileSize*3)
-		if expectedSize > 0 {
-			stats.CompressionRatio = float64(expectedSize) / float64(stats.StorageBytes)
-		}
+	// Calculate percentages
+	if stats.TotalTiles > 0 {
+		stats.DirectPercent = float64(stats.DirectTiles) / float64(stats.TotalTiles) * 100.0
+		stats.DeduplicatedPercent = float64(stats.DeduplicatedTiles) / float64(stats.TotalTiles) * 100.0
+	}
+
+	// Calculate compression ratio based on actual original size vs storage size
+	if stats.OriginalBytes > 0 && stats.StorageBytes > 0 {
+		stats.CompressionRatio = float64(stats.OriginalBytes) / float64(stats.StorageBytes)
 	}
 
 	return stats
