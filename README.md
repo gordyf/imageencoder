@@ -78,6 +78,18 @@ curl http://localhost:8080/images/my-screenshot-id > retrieved.png
 curl http://localhost:8080/images
 ```
 
+### Get Debug Visualization
+
+```bash
+curl http://localhost:8080/debug/my-screenshot-id > debug.png
+```
+
+The debug image shows color-coded tiles:
+- **Green**: Unique tiles (newly stored)
+- **Blue**: Duplicate tiles (exact hash match)
+- **Yellow**: Delta-encoded tiles (stored as difference from similar tile)
+- **Red**: Error/unknown storage type
+
 ### Get Storage Statistics
 
 ```bash

@@ -3,6 +3,8 @@ package imagestore
 import (
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
 	"log"
 	"path/filepath"
 	"time"
@@ -104,7 +106,13 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 			// Check if exact tile already exists (by hash)
 			if existing := tilesBkt.Get(tileKey); existing != nil {
 				// Tile already exists, just reference it
-				storedImage.TileRefs[i] = tileRefs[i]
+				storedImage.TileRefs[i] = TileRef{
+					X:           tileRefs[i].X,
+					Y:           tileRefs[i].Y,
+					TileID:      tileRefs[i].TileID,
+					IsDelta:     false,
+					StorageType: StorageDuplicate,
+				}
 				continue
 			}
 
@@ -115,7 +123,7 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 				if err != nil {
 					return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
 				}
-				
+
 				// Store features
 				features, err := ExtractTileFeatures(tile.ID, tile.Data, s.config.TileSize)
 				if err == nil {
@@ -125,17 +133,23 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 						s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
 					}
 				}
-				
-				storedImage.TileRefs[i] = tileRefs[i]
+
+				storedImage.TileRefs[i] = TileRef{
+					X:           tileRefs[i].X,
+					Y:           tileRefs[i].Y,
+					TileID:      tileRefs[i].TileID,
+					IsDelta:     false,
+					StorageType: StorageUnique,
+				}
 				continue
 			}
 
-			// Find similar tile for delta encoding with stricter thresholds
+			// Find similar tile for delta encoding
 			bestMatch, pixelDistance, err := s.similarityMatcher.BestMatchWithPixelCheck(
 				tile.Data,
 				s.config.TileSize,
-				0.15, // Stricter feature threshold  
-				s.config.SimilarityThreshold,
+				0.15,                         // Feature threshold
+				s.config.SimilarityThreshold, // Pixel threshold
 				func(tileID TileID) ([]byte, error) {
 					return s.getTileDataFromTx(tx, tileID)
 				},
@@ -149,28 +163,12 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 					if err == nil {
 						deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
 						if err == nil {
-							// Verify delta reconstruction matches original
-							reconstructed, verifyErr := ApplyDelta(baseData, deltaData, s.config.TileSize)
-							isReconstructionPerfect := false
-							if verifyErr == nil {
-								// Check if reconstruction is identical to original
-								isReconstructionPerfect = len(reconstructed) == len(tile.Data)
-								if isReconstructionPerfect {
-									for j := 0; j < len(tile.Data); j++ {
-										if reconstructed[j] != tile.Data[j] {
-											isReconstructionPerfect = false
-											break
-										}
-									}
-								}
-							}
-							
-							// More conservative: only use delta if it's significantly smaller (at least 25% savings)
-							// pixel distance is very small, AND reconstruction is perfect
+							// Only use delta if it's significantly smaller (at least 25% savings)
 							deltaIsSmaller := len(deltaData) < (len(tile.Data) * 3 / 4)
-							pixelDistanceIsVerySmall := pixelDistance < 0.05
-							
-							if deltaIsSmaller && pixelDistanceIsVerySmall && isReconstructionPerfect {
+							// debug log if delta is not smaller
+							if !deltaIsSmaller {
+								log.Printf("Delta for tile %s is not smaller than original (%d vs %d bytes)", tile.ID, len(deltaData), len(tile.Data))
+							} else {
 								deltaKey := []byte(tile.ID)
 								tileDelta := CreateTileDelta(*bestMatch, deltaData)
 
@@ -179,10 +177,11 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 									err = deltasBkt.Put(deltaKey, deltaBytes)
 									if err == nil {
 										storedImage.TileRefs[i] = TileRef{
-											X:       tileRefs[i].X,
-											Y:       tileRefs[i].Y,
-											TileID:  tile.ID,
-											IsDelta: true,
+											X:           tileRefs[i].X,
+											Y:           tileRefs[i].Y,
+											TileID:      tile.ID,
+											IsDelta:     true,
+											StorageType: StorageDelta,
 										}
 										continue
 									}
@@ -209,7 +208,13 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 				}
 			}
 
-			storedImage.TileRefs[i] = tileRefs[i]
+			storedImage.TileRefs[i] = TileRef{
+				X:           tileRefs[i].X,
+				Y:           tileRefs[i].Y,
+				TileID:      tileRefs[i].TileID,
+				IsDelta:     false,
+				StorageType: StorageUnique,
+			}
 		}
 
 		// Store image metadata
@@ -339,6 +344,81 @@ func (s *BoltImageStore) GetStorageStats() StorageStats {
 // Close closes the database
 func (s *BoltImageStore) Close() error {
 	return s.db.Close()
+}
+
+// RetrieveDebugImage generates a color-coded debug visualization
+func (s *BoltImageStore) RetrieveDebugImage(id string) ([]byte, error) {
+	var storedImage StoredImage
+
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		imagesBkt := tx.Bucket(imagesBucket)
+		imageData := imagesBkt.Get([]byte(id))
+		if imageData == nil {
+			return fmt.Errorf("image not found: %s", id)
+		}
+
+		return json.Unmarshal(imageData, &storedImage)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Create debug image with color-coded tiles
+	img := image.NewRGBA(image.Rect(0, 0, storedImage.Width, storedImage.Height))
+
+	// Define colors for different storage types
+	colors := map[StorageType]color.RGBA{
+		StorageUnique:    {0, 255, 0, 255},   // Green - newly stored tile
+		StorageDuplicate: {0, 0, 255, 255},   // Blue - exact duplicate
+		StorageDelta:     {255, 255, 0, 255}, // Yellow - delta encoded
+	}
+
+	// Fill each tile area with the appropriate color
+	for _, tileRef := range storedImage.TileRefs {
+		tileColor, ok := colors[tileRef.StorageType]
+		if !ok {
+			tileColor = color.RGBA{255, 0, 0, 255} // Red for unknown/error
+		}
+
+		// Calculate tile boundaries
+		startX := tileRef.X * s.config.TileSize
+		startY := tileRef.Y * s.config.TileSize
+		endX := min(startX+s.config.TileSize, storedImage.Width)
+		endY := min(startY+s.config.TileSize, storedImage.Height)
+
+		// Fill tile area with color
+		for y := startY; y < endY; y++ {
+			for x := startX; x < endX; x++ {
+				img.Set(x, y, tileColor)
+			}
+		}
+
+		// Add a thin border for tile boundaries
+		borderColor := color.RGBA{0, 0, 0, 255} // Black border
+
+		// Top and bottom borders
+		for x := startX; x < endX; x++ {
+			if startY < storedImage.Height {
+				img.Set(x, startY, borderColor)
+			}
+			if endY-1 < storedImage.Height {
+				img.Set(x, endY-1, borderColor)
+			}
+		}
+
+		// Left and right borders
+		for y := startY; y < endY; y++ {
+			if startX < storedImage.Width {
+				img.Set(startX, y, borderColor)
+			}
+			if endX-1 < storedImage.Width {
+				img.Set(endX-1, y, borderColor)
+			}
+		}
+	}
+
+	// Encode to PNG
+	return encodeImageToPNG(img)
 }
 
 // getTileData retrieves tile data by ID

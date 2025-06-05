@@ -6,8 +6,8 @@
     "write_timeout_seconds": 30
   },
   "image_store": {
-    "tile_size": 256,
-    "similarity_threshold": 0.05,
+    "tile_size": 32,
+    "similarity_threshold": 0.75,
     "database_path": "./imagestore.db"
   },
   "log_level": "info"

@@ -36,10 +36,32 @@ type StoredImage struct {
 	Metadata map[string]string
 }
 
+type StorageType uint8
+
+const (
+	StorageUnique    StorageType = iota // Newly stored unique tile
+	StorageDuplicate                    // Exact duplicate of existing tile
+	StorageDelta                        // Delta-encoded from similar tile
+)
+
+func (s StorageType) String() string {
+	switch s {
+	case StorageUnique:
+		return "unique"
+	case StorageDuplicate:
+		return "duplicate"
+	case StorageDelta:
+		return "delta"
+	default:
+		return "unknown"
+	}
+}
+
 type TileRef struct {
-	X, Y    int    // Position in image (tile coordinates)
-	TileID  TileID // Reference to tile or delta
-	IsDelta bool   // Whether this references a delta
+	X, Y        int         // Position in image (tile coordinates)
+	TileID      TileID      // Reference to tile or delta
+	IsDelta     bool        // Whether this references a delta
+	StorageType StorageType // How this tile was stored
 }
 
 type StorageStats struct {

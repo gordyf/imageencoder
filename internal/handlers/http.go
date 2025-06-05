@@ -27,6 +27,7 @@ func NewImageHandler(store imagestore.ImageStore) *ImageHandler {
 func (h *ImageHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/images/", h.handleImages)
 	mux.HandleFunc("/images", h.handleImagesList)
+	mux.HandleFunc("/debug/", h.handleDebugImage)
 	mux.HandleFunc("/stats", h.handleStats)
 	mux.HandleFunc("/health", h.handleHealth)
 }
@@ -198,6 +199,50 @@ func (h *ImageHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"service": "imageencoder",
 	})
+}
+
+// handleDebugImage handles GET /debug/{id}
+func (h *ImageHandler) handleDebugImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract image ID from path
+	path := strings.TrimPrefix(r.URL.Path, "/debug/")
+	if path == "" {
+		http.Error(w, "Missing image ID", http.StatusBadRequest)
+		return
+	}
+
+	imageID := path
+
+	// Check if the store supports debug images
+	type debugImageStore interface {
+		RetrieveDebugImage(id string) ([]byte, error)
+	}
+
+	debugStore, ok := h.store.(debugImageStore)
+	if !ok {
+		http.Error(w, "Debug images not supported by this store", http.StatusNotImplemented)
+		return
+	}
+
+	imageData, err := debugStore.RetrieveDebugImage(imageID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, "Image not found", http.StatusNotFound)
+			return
+		}
+		log.Printf("Error retrieving debug image %s: %v", imageID, err)
+		http.Error(w, "Failed to retrieve debug image", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"debug_%s.png\"", imageID))
+	w.Write(imageData)
 }
 
 // isValidImageType checks if the content type is a supported image format
