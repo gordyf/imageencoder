@@ -187,20 +187,24 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 				continue
 			}
 
-			// Find similar tile for delta encoding
-			bestMatch, err := s.similarityMatcher.BestMatch(
-				tile.Data,
-				s.config.TileSize,
-				func(tileID TileID) ([]byte, error) {
-					return s.getTileDataFromTx(tx, tileID)
-				},
-			)
+			// Find similar tile for delta encoding (only if enabled)
+			var bestMatch *TileID
+			var err error
+			if s.config.EnableDeltaTiles {
+				bestMatch, err = s.similarityMatcher.BestMatch(
+					tile.Data,
+					s.config.TileSize,
+					func(tileID TileID) ([]byte, error) {
+						return s.getTileDataFromTx(tx, tileID)
+					},
+				)
+			}
 
 			if bestMatch == nil {
 				noBestMatch++
 			}
 
-			if err == nil && bestMatch != nil {
+			if s.config.EnableDeltaTiles && err == nil && bestMatch != nil {
 				// Create delta
 				baseData, err := s.getTileDataFromTx(tx, *bestMatch)
 				if err == nil {

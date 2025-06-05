@@ -85,6 +85,7 @@ type Config struct {
 	TileSize            int     // Default 256
 	SimilarityThreshold float64 // Default 0.1 (10% difference threshold)
 	DatabasePath        string
+	EnableDeltaTiles    bool    // Default true
 }
 
 func DefaultConfig() *Config {
@@ -92,6 +93,7 @@ func DefaultConfig() *Config {
 		TileSize:            256,
 		SimilarityThreshold: 0.05, // More conservative: 5% difference threshold
 		DatabasePath:        "./imagestore.db",
+		EnableDeltaTiles:    true,
 	}
 }
 

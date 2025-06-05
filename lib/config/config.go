@@ -20,6 +20,7 @@ type ImageStoreConfig struct {
 	TileSize            int     `json:"tile_size"`
 	SimilarityThreshold float64 `json:"similarity_threshold"`
 	DatabasePath        string  `json:"database_path"`
+	EnableDeltaTiles    bool    `json:"enable_delta_tiles"`
 }
 
 // Config holds the complete application configuration
@@ -42,6 +43,7 @@ func DefaultConfig() *Config {
 			TileSize:            256,
 			SimilarityThreshold: 0.1,
 			DatabasePath:        "./imagestore.db",
+			EnableDeltaTiles:    true,
 		},
 		LogLevel: "info",
 	}

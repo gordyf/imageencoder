@@ -8,7 +8,8 @@
   "image_store": {
     "tile_size": 32,
     "similarity_threshold": 0.75,
-    "database_path": "./imagestore.db"
+    "database_path": "./imagestore.db",
+    "enable_delta_tiles": true
   },
   "log_level": "info"
 }
