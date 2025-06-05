@@ -9,14 +9,11 @@ import (
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/klauspost/compress/zstd"
 )
 
 var (
-	tilesBucket    = []byte("tiles")
-	deltasBucket   = []byte("deltas")
-	imagesBucket   = []byte("images")
-	featuresBucket = []byte("features")
+	tilesBucket  = []byte("tiles")
+	imagesBucket = []byte("images")
 )
 
 // makeKey safely constructs a key with bucket prefix and suffix
@@ -38,11 +35,8 @@ func makePrefixKey(bucket []byte) []byte {
 
 // PebbleImageStore implements ImageStore using Pebble
 type PebbleImageStore struct {
-	db                *pebble.DB
-	config            *Config
-	similarityMatcher *SimilarityMatcher
-	encoder           *zstd.Encoder
-	decoder           *zstd.Decoder
+	db     *pebble.DB
+	config *Config
 }
 
 // NewPebbleImageStore creates a new Pebble-backed image store
@@ -58,32 +52,9 @@ func NewPebbleImageStore(config *Config) (*PebbleImageStore, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Create zstd encoder and decoder
-	encoder, err := zstd.NewWriter(nil)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
-	}
-
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		db.Close()
-		encoder.Close()
-		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
-	}
-
 	store := &PebbleImageStore{
-		db:                db,
-		config:            config,
-		similarityMatcher: NewSimilarityMatcher(),
-		encoder:           encoder,
-		decoder:           decoder,
-	}
-
-	// Load existing features into similarity matcher
-	err = store.loadFeatures()
-	if err != nil {
-		log.Printf("Warning: failed to load features: %v", err)
+		db:     db,
+		config: config,
 	}
 
 	return store, nil
@@ -93,7 +64,6 @@ func NewPebbleImageStore(config *Config) (*PebbleImageStore, error) {
 func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 	dedupMatch := 0
 	directStore := 0
-	deltaStore := 0
 	noBestMatch := 0
 
 	// Convert image data to image.Image
@@ -139,20 +109,6 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 				X:           tileRefs[i].X,
 				Y:           tileRefs[i].Y,
 				TileID:      tileRefs[i].TileID,
-				IsDelta:     false,
-				StorageType: StorageDuplicate,
-			}
-			continue
-		}
-		deltaKey := makeKey(deltasBucket, string(tile.ID))
-		if _, closer, err := s.db.Get(deltaKey); err == nil {
-			closer.Close()
-			dedupMatch++
-			storedImage.TileRefs[i] = TileRef{
-				X:           tileRefs[i].X,
-				Y:           tileRefs[i].Y,
-				TileID:      tileRefs[i].TileID,
-				IsDelta:     false,
 				StorageType: StorageDuplicate,
 			}
 			continue
@@ -166,7 +122,6 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 				X:           tileRefs[i].X,
 				Y:           tileRefs[i].Y,
 				TileID:      tileRefs[i].TileID,
-				IsDelta:     false,
 				StorageType: StorageDuplicate,
 			}
 			continue
@@ -175,92 +130,6 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 		// Mark this tile as processed in this batch
 		processedTiles[tile.ID] = true
 
-		// Check if we have any tiles at all for similarity matching
-		if s.similarityMatcher.Size() == 0 {
-			directStore++
-			// No existing tiles, store this one directly (compressed)
-			compressedData, err := s.compressTileData(tile.Data)
-			if err != nil {
-				return fmt.Errorf("failed to compress tile %s: %w", tile.ID, err)
-			}
-			err = batch.Set(tileKey, compressedData, pebble.Sync)
-			if err != nil {
-				return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
-			}
-			log.Printf("Storing new tile: %s (key: %s)", tile.ID, string(tileKey))
-
-			// Store features
-			features, err := ExtractTileFeatures(tile.ID, tile.Data, s.config.TileSize)
-			if err == nil {
-				featuresBytes, err := json.Marshal(features)
-				if err == nil {
-					featuresKey := makeKey(featuresBucket, string(tile.ID))
-					batch.Set(featuresKey, featuresBytes, pebble.Sync)
-					s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
-				}
-			}
-
-			storedImage.TileRefs[i] = TileRef{
-				X:           tileRefs[i].X,
-				Y:           tileRefs[i].Y,
-				TileID:      tileRefs[i].TileID,
-				IsDelta:     false,
-				StorageType: StorageUnique,
-			}
-			continue
-		}
-
-		// Find similar tile for delta encoding (only if enabled)
-		var bestMatch *TileID
-		var err error
-		if s.config.EnableDeltaTiles {
-			bestMatch, err = s.similarityMatcher.BestMatch(
-				tile.Data,
-				s.config.TileSize,
-				func(tileID TileID) ([]byte, error) {
-					return s.getTileData(tileID)
-				},
-			)
-		}
-
-		if bestMatch == nil {
-			noBestMatch++
-		}
-
-		if s.config.EnableDeltaTiles && err == nil && bestMatch != nil {
-			// Create delta
-			baseData, err := s.getTileData(*bestMatch)
-			if err == nil {
-				deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
-				if err == nil {
-					// Only use delta if it's significantly smaller (at least 25% savings)
-					deltaIsSmaller := len(deltaData) < (len(tile.Data) * 3 / 4)
-					// debug log if delta is not smaller
-					if !deltaIsSmaller {
-						log.Printf("Delta for tile %s is not smaller than original (%d vs %d bytes)", tile.ID, len(deltaData), len(tile.Data))
-					} else {
-						deltaStore++
-						deltaKey := makeKey(deltasBucket, string(tile.ID))
-						tileDelta := CreateTileDelta(*bestMatch, deltaData)
-
-						deltaBytes, err := json.Marshal(tileDelta)
-						if err == nil {
-							err = batch.Set(deltaKey, deltaBytes, pebble.Sync)
-							if err == nil {
-								storedImage.TileRefs[i] = TileRef{
-									X:           tileRefs[i].X,
-									Y:           tileRefs[i].Y,
-									TileID:      tile.ID,
-									IsDelta:     true,
-									StorageType: StorageDelta,
-								}
-								continue
-							}
-						}
-					}
-				}
-			}
-		}
 		directStore++
 		// Store as new tile (compressed)
 		compressedData, err := s.compressTileData(tile.Data)
@@ -273,22 +142,10 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 		}
 		log.Printf("Storing new tile: %s (key: %s)", tile.ID, string(tileKey))
 
-		// Store features
-		features, err := ExtractTileFeatures(tile.ID, tile.Data, s.config.TileSize)
-		if err == nil {
-			featuresBytes, err := json.Marshal(features)
-			if err == nil {
-				featuresKey := makeKey(featuresBucket, string(tile.ID))
-				batch.Set(featuresKey, featuresBytes, pebble.Sync)
-				s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
-			}
-		}
-
 		storedImage.TileRefs[i] = TileRef{
 			X:           tileRefs[i].X,
 			Y:           tileRefs[i].Y,
 			TileID:      tileRefs[i].TileID,
-			IsDelta:     false,
 			StorageType: StorageUnique,
 		}
 	}
@@ -311,7 +168,6 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 	}
 
 	fmt.Println("Deduplication matches found:", dedupMatch)
-	fmt.Println("Direct stores:", directStore, "Delta stores:", deltaStore)
 	fmt.Println("No best matches found:", noBestMatch)
 	return nil
 }
@@ -425,8 +281,6 @@ func (s *PebbleImageStore) GetStorageStats() StorageStats {
 					stats.DirectTiles++
 				case StorageDuplicate:
 					stats.DeduplicatedTiles++
-				case StorageDelta:
-					stats.DeduplicatedTiles++
 				}
 			}
 
@@ -450,20 +304,6 @@ func (s *PebbleImageStore) GetStorageStats() StorageStats {
 		}
 	}
 
-	// Count deltas and their storage size
-	deltasPrefix := makePrefixKey(deltasBucket)
-	deltasIter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: deltasPrefix,
-		UpperBound: append(deltasPrefix, 0xFF),
-	})
-	if err == nil {
-		defer deltasIter.Close()
-		for deltasIter.First(); deltasIter.Valid(); deltasIter.Next() {
-			stats.TotalDeltas++
-			stats.StorageBytes += int64(len(deltasIter.Value()))
-		}
-	}
-
 	// Calculate percentages
 	if stats.TotalTiles > 0 {
 		stats.DirectPercent = float64(stats.DirectTiles) / float64(stats.TotalTiles) * 100.0
@@ -480,12 +320,6 @@ func (s *PebbleImageStore) GetStorageStats() StorageStats {
 
 // Close closes the database
 func (s *PebbleImageStore) Close() error {
-	if s.encoder != nil {
-		s.encoder.Close()
-	}
-	if s.decoder != nil {
-		s.decoder.Close()
-	}
 	return s.db.Close()
 }
 
@@ -573,9 +407,8 @@ func (s *PebbleImageStore) RetrieveDebugImage(id string) ([]byte, error) {
 
 	// Define colors for different storage types
 	colors := map[StorageType]color.RGBA{
-		StorageUnique:    {0, 255, 0, 255},   // Green - newly stored tile
-		StorageDuplicate: {0, 0, 255, 255},   // Blue - exact duplicate
-		StorageDelta:     {255, 255, 0, 255}, // Yellow - delta encoded
+		StorageUnique:    {0, 255, 0, 255}, // Green - newly stored tile
+		StorageDuplicate: {0, 0, 255, 255}, // Blue - exact duplicate
 	}
 
 	// Fill each tile area with the appropriate color
@@ -641,52 +474,5 @@ func (s *PebbleImageStore) getTileData(tileID TileID) ([]byte, error) {
 		return decompressedData, nil
 	}
 
-	// Try deltas bucket
-	deltaKey := makeKey(deltasBucket, string(tileID))
-	if deltaData, closer, err := s.db.Get(deltaKey); err == nil {
-		defer closer.Close()
-		var tileDelta TileDelta
-		err := json.Unmarshal(deltaData, &tileDelta)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal delta: %w", err)
-		}
-
-		// Get base tile
-		baseData, err := s.getTileData(tileDelta.BaseID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get base tile %s: %w", tileDelta.BaseID, err)
-		}
-
-		// Apply delta
-		return ApplyDelta(baseData, tileDelta.Delta, s.config.TileSize)
-	}
-
 	return nil, fmt.Errorf("tile not found: %s", tileID)
-}
-
-// loadFeatures loads existing tile features into the similarity matcher
-func (s *PebbleImageStore) loadFeatures() error {
-	featuresPrefix := makePrefixKey(featuresBucket)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: featuresPrefix,
-		UpperBound: append(featuresPrefix, 0xFF),
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-
-	for iter.First(); iter.Valid(); iter.Next() {
-		var features TileFeatures
-		err := json.Unmarshal(iter.Value(), &features)
-		if err != nil {
-			log.Printf("Warning: failed to unmarshal features for tile %s: %v", iter.Key(), err)
-			continue // Continue with other features
-		}
-
-		// Add to similarity matcher (we don't need the actual tile data here)
-		s.similarityMatcher.features = append(s.similarityMatcher.features, features)
-	}
-
-	return iter.Error()
 }

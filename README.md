@@ -1,11 +1,10 @@
-# Image Encoder - Tile Dictionary + Delta Encoding Image Storage System
+# Image Encoder - Tile Dictionary Encoding Image Storage System
 
-A Go library and HTTP service for efficient storage of similar images using tile-based deduplication with delta encoding. Designed for website screenshots and other collections of similar images.
+A Go library and HTTP service for efficient storage of similar images using tile-based deduplication. Designed for website screenshots and other collections of similar images.
 
 ## Features
 
 - **Tile-based deduplication**: Images are divided into 256x256 pixel tiles
-- **Delta encoding**: Similar tiles are stored as deltas from existing tiles
 - **Content-addressed storage**: Unique tiles stored once using SHA-256 hashing
 - **HTTP API**: RESTful API for storing, retrieving, and managing images
 - **Sub-linear storage growth**: Efficient storage for collections of similar images
@@ -85,9 +84,9 @@ curl http://localhost:8080/debug/my-screenshot-id > debug.png
 ```
 
 The debug image shows color-coded tiles:
+
 - **Green**: Unique tiles (newly stored)
 - **Blue**: Duplicate tiles (exact hash match)
-- **Yellow**: Delta-encoded tiles (stored as difference from similar tile)
 - **Red**: Error/unknown storage type
 
 ### Get Storage Statistics
@@ -116,7 +115,6 @@ You can configure the server using environment variables:
 - `SERVER_HOST` - Server host (default: localhost)
 - `DATABASE_PATH` - Database file path (default: ./imagestore.db)
 - `TILE_SIZE` - Tile size in pixels (default: 256)
-- `SIMILARITY_THRESHOLD` - Similarity threshold for delta encoding (default: 0.1)
 - `LOG_LEVEL` - Log level: debug, info, warn, error (default: info)
 
 ## How It Works
@@ -126,16 +124,14 @@ You can configure the server using environment variables:
 1. **Image Tiling**: Each image is divided into fixed-size tiles (256x256 pixels)
 2. **Hash-based Deduplication**: Each tile is hashed (SHA-256) and stored only once
 3. **Similarity Matching**: For new tiles, the system finds the most similar existing tile
-4. **Delta Encoding**: If similarity is above threshold, store only the difference (delta)
-5. **Reconstruction**: Images are rebuilt by assembling tiles and applying deltas
+4. **Reconstruction**: Images are rebuilt by assembling tiles
 
 ### Storage Layout
 
 The system uses Pebble with the following key prefixes:
+
 - `tiles` - Unique tile data indexed by tile ID
-- `deltas` - Delta data for similar tiles
 - `images` - Image metadata and tile references
-- `features` - Tile features for similarity matching
 
 ### Performance Characteristics
 
@@ -153,8 +149,6 @@ lib/
   imagestore/
     store.go              - Core types and interfaces
     tiles.go              - Tile extraction/reconstruction
-    delta.go              - Delta computation and encoding
-    similarity.go         - Tile similarity matching
     storage.go            - Pebble persistence layer
   config/config.go        - Configuration management
 internal/

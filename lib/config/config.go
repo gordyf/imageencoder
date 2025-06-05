@@ -17,10 +17,8 @@ type ServerConfig struct {
 
 // ImageStoreConfig holds image store configuration
 type ImageStoreConfig struct {
-	TileSize            int     `json:"tile_size"`
-	SimilarityThreshold float64 `json:"similarity_threshold"`
-	DatabasePath        string  `json:"database_path"`
-	EnableDeltaTiles    bool    `json:"enable_delta_tiles"`
+	TileSize     int    `json:"tile_size"`
+	DatabasePath string `json:"database_path"`
 }
 
 // Config holds the complete application configuration
@@ -40,10 +38,8 @@ func DefaultConfig() *Config {
 			WriteTimeout: 30,
 		},
 		ImageStore: ImageStoreConfig{
-			TileSize:            256,
-			SimilarityThreshold: 0.1,
-			DatabasePath:        "./imagestore.db",
-			EnableDeltaTiles:    true,
+			TileSize:     256,
+			DatabasePath: "./imagestore.db",
 		},
 		LogLevel: "info",
 	}
@@ -115,10 +111,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid tile size: %d", c.ImageStore.TileSize)
 	}
 
-	if c.ImageStore.SimilarityThreshold < 0 || c.ImageStore.SimilarityThreshold > 1 {
-		return fmt.Errorf("invalid similarity threshold: %f", c.ImageStore.SimilarityThreshold)
-	}
-
 	if c.ImageStore.DatabasePath == "" {
 		return fmt.Errorf("database path cannot be empty")
 	}
@@ -167,10 +159,6 @@ func LoadConfigFromEnv() *Config {
 	// Image store config from env
 	if tileSize := os.Getenv("TILE_SIZE"); tileSize != "" {
 		fmt.Sscanf(tileSize, "%d", &config.ImageStore.TileSize)
-	}
-
-	if threshold := os.Getenv("SIMILARITY_THRESHOLD"); threshold != "" {
-		fmt.Sscanf(threshold, "%f", &config.ImageStore.SimilarityThreshold)
 	}
 
 	if dbPath := os.Getenv("DATABASE_PATH"); dbPath != "" {

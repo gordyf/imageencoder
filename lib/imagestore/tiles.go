@@ -42,10 +42,9 @@ func ExtractTiles(img image.Image, tileSize int) ([]Tile, []TileRef, error) {
 
 			// Create tile reference
 			tileRef := TileRef{
-				X:       tileX,
-				Y:       tileY,
-				TileID:  tileID,
-				IsDelta: false,
+				X:      tileX,
+				Y:      tileY,
+				TileID: tileID,
 			}
 
 			tiles = append(tiles, tile)

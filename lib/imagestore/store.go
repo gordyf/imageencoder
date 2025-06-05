@@ -23,11 +23,6 @@ type Tile struct {
 	Data []byte // Raw RGB data for 256x256 tile (256*256*3 bytes)
 }
 
-type TileDelta struct {
-	BaseID TileID
-	Delta  []byte // Compressed difference data
-}
-
 type StoredImage struct {
 	ID       string
 	Width    int
@@ -41,7 +36,6 @@ type StorageType uint8
 const (
 	StorageUnique    StorageType = iota // Newly stored unique tile
 	StorageDuplicate                    // Exact duplicate of existing tile
-	StorageDelta                        // Delta-encoded from similar tile
 )
 
 func (s StorageType) String() string {
@@ -50,8 +44,6 @@ func (s StorageType) String() string {
 		return "unique"
 	case StorageDuplicate:
 		return "duplicate"
-	case StorageDelta:
-		return "delta"
 	default:
 		return "unknown"
 	}
@@ -59,8 +51,7 @@ func (s StorageType) String() string {
 
 type TileRef struct {
 	X, Y        int         // Position in image (tile coordinates)
-	TileID      TileID      // Reference to tile or delta
-	IsDelta     bool        // Whether this references a delta
+	TileID      TileID      // Reference to tile
 	StorageType StorageType // How this tile was stored
 }
 
@@ -68,7 +59,6 @@ type StorageStats struct {
 	TotalImages         int
 	TotalTiles          int
 	UniqueTiles         int
-	TotalDeltas         int
 	DirectTiles         int
 	DeduplicatedTiles   int
 	DirectPercent       float64
@@ -91,7 +81,6 @@ type Config struct {
 	TileSize            int     // Default 256
 	SimilarityThreshold float64 // Default 0.1 (10% difference threshold)
 	DatabasePath        string
-	EnableDeltaTiles    bool    // Default true
 }
 
 func DefaultConfig() *Config {
@@ -99,7 +88,6 @@ func DefaultConfig() *Config {
 		TileSize:            256,
 		SimilarityThreshold: 0.05, // More conservative: 5% difference threshold
 		DatabasePath:        "./imagestore.db",
-		EnableDeltaTiles:    true,
 	}
 }
 
