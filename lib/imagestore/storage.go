@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"path/filepath"
 
+	"github.com/DataDog/zstd"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -321,64 +322,29 @@ func (s *PebbleImageStore) Close() error {
 	return s.db.Close()
 }
 
-// compressTileData compresses tile data using PNG
+// compressTileData compresses tile data using zstd
 func (s *PebbleImageStore) compressTileData(data []byte) ([]byte, error) {
-	// Convert raw RGB data to image.RGBA
-	img := image.NewRGBA(image.Rect(0, 0, s.config.TileSize, s.config.TileSize))
-
 	expectedSize := s.config.TileSize * s.config.TileSize * 3
 	if len(data) != expectedSize {
 		return nil, fmt.Errorf("invalid tile data size: expected %d, got %d", expectedSize, len(data))
 	}
 
-	// Convert RGB to RGBA
-	for y := 0; y < s.config.TileSize; y++ {
-		for x := 0; x < s.config.TileSize; x++ {
-			i := (y*s.config.TileSize + x) * 3
-			r := data[i]
-			g := data[i+1]
-			b := data[i+2]
-			img.Set(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
-		}
-	}
-
-	// Encode as PNG
-	return encodeImageToPNG(img)
+	// Compress using zstd
+	return zstd.Compress(nil, data)
 }
 
-// decompressTileData decompresses tile data from PNG
+// decompressTileData decompresses tile data from zstd
 func (s *PebbleImageStore) decompressTileData(compressedData []byte) ([]byte, error) {
-	// Decode PNG image
-	img, err := decodeImageFromBytes(compressedData)
+	// Decompress using zstd
+	data, err := zstd.Decompress(nil, compressedData)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode PNG tile: %w", err)
+		return nil, fmt.Errorf("failed to decompress zstd tile: %w", err)
 	}
 
-	bounds := img.Bounds()
-	width, height := bounds.Dx(), bounds.Dy()
-
-	// Validate tile dimensions
-	if width != s.config.TileSize || height != s.config.TileSize {
-		return nil, fmt.Errorf("invalid tile dimensions: expected %dx%d, got %dx%d",
-			s.config.TileSize, s.config.TileSize, width, height)
-	}
-
-	// Convert back to raw RGB data
-	data := make([]byte, s.config.TileSize*s.config.TileSize*3)
-
-	for y := 0; y < s.config.TileSize; y++ {
-		for x := 0; x < s.config.TileSize; x++ {
-			pixel := img.At(x, y)
-			rVal, gVal, bVal, _ := pixel.RGBA()
-			r := uint8(rVal >> 8)
-			g := uint8(gVal >> 8)
-			b := uint8(bVal >> 8)
-
-			i := (y*s.config.TileSize + x) * 3
-			data[i] = r
-			data[i+1] = g
-			data[i+2] = b
-		}
+	// Validate tile data size
+	expectedSize := s.config.TileSize * s.config.TileSize * 3
+	if len(data) != expectedSize {
+		return nil, fmt.Errorf("invalid decompressed tile data size: expected %d, got %d", expectedSize, len(data))
 	}
 
 	return data, nil
