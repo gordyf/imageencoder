@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"log"
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
@@ -80,11 +79,12 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 
 	bounds := img.Bounds()
 	storedImage := &StoredImage{
-		ID:       id,
-		Width:    bounds.Dx(),
-		Height:   bounds.Dy(),
-		TileRefs: make([]TileRef, len(tileRefs)),
-		Metadata: make(map[string]string),
+		ID:            id,
+		Width:         bounds.Dx(),
+		Height:        bounds.Dy(),
+		TileRefs:      make([]TileRef, len(tileRefs)),
+		Metadata:      make(map[string]string),
+		OriginalBytes: int64(len(imageData)), // Store original PNG input size
 	}
 
 	// Use batch for atomic operations
@@ -140,7 +140,6 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 		if err != nil {
 			return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
 		}
-		log.Printf("Storing new tile: %s (key: %s)", tile.ID, string(tileKey))
 
 		storedImage.TileRefs[i] = TileRef{
 			X:           tileRefs[i].X,
@@ -284,9 +283,8 @@ func (s *PebbleImageStore) GetStorageStats() StorageStats {
 				}
 			}
 
-			// Calculate original uncompressed size for this image
-			totalPixels := int64(storedImage.Width * storedImage.Height)
-			stats.OriginalBytes += totalPixels * 3 // 3 bytes per pixel (RGB)
+			// Use stored original PNG input size
+			stats.OriginalBytes += storedImage.OriginalBytes
 		}
 	}
 

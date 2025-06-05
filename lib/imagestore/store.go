@@ -24,11 +24,12 @@ type Tile struct {
 }
 
 type StoredImage struct {
-	ID       string
-	Width    int
-	Height   int
-	TileRefs []TileRef
-	Metadata map[string]string
+	ID            string
+	Width         int
+	Height        int
+	TileRefs      []TileRef
+	Metadata      map[string]string
+	OriginalBytes int64 // Size of original PNG input data
 }
 
 type StorageType uint8

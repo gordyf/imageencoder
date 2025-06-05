@@ -186,9 +186,9 @@ func TestPlaceTileData(t *testing.T) {
 	// Create test tile data (4x4 red tile)
 	tileData := make([]byte, tileSize*tileSize*3)
 	for i := 0; i < len(tileData); i += 3 {
-		tileData[i] = 255   // R
-		tileData[i+1] = 0   // G
-		tileData[i+2] = 0   // B
+		tileData[i] = 255 // R
+		tileData[i+1] = 0 // G
+		tileData[i+2] = 0 // B
 	}
 
 	// Place tile at position (2, 2)
@@ -247,7 +247,7 @@ func TestCreateEmptyTile(t *testing.T) {
 
 func TestValidateTileData(t *testing.T) {
 	tileSize := 4
-	
+
 	// Valid tile data
 	validData := make([]byte, tileSize*tileSize*3)
 	err := ValidateTileData(validData, tileSize)

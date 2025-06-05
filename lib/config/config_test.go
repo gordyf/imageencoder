@@ -41,54 +41,54 @@ func TestConfigValidation(t *testing.T) {
 		{
 			name: "invalid port - zero",
 			config: &Config{
-				Server: ServerConfig{Port: 0, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
+				Server:     ServerConfig{Port: 0, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
 				ImageStore: ImageStoreConfig{TileSize: 256, DatabasePath: "./test.db"},
-				LogLevel: "info",
+				LogLevel:   "info",
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid port - too high",
 			config: &Config{
-				Server: ServerConfig{Port: 65536, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
+				Server:     ServerConfig{Port: 65536, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
 				ImageStore: ImageStoreConfig{TileSize: 256, DatabasePath: "./test.db"},
-				LogLevel: "info",
+				LogLevel:   "info",
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid read timeout",
 			config: &Config{
-				Server: ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 0, WriteTimeout: 30},
+				Server:     ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 0, WriteTimeout: 30},
 				ImageStore: ImageStoreConfig{TileSize: 256, DatabasePath: "./test.db"},
-				LogLevel: "info",
+				LogLevel:   "info",
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid tile size",
 			config: &Config{
-				Server: ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
+				Server:     ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
 				ImageStore: ImageStoreConfig{TileSize: 0, DatabasePath: "./test.db"},
-				LogLevel: "info",
+				LogLevel:   "info",
 			},
 			wantErr: true,
 		},
 		{
 			name: "empty database path",
 			config: &Config{
-				Server: ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
+				Server:     ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
 				ImageStore: ImageStoreConfig{TileSize: 256, DatabasePath: ""},
-				LogLevel: "info",
+				LogLevel:   "info",
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid log level",
 			config: &Config{
-				Server: ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
+				Server:     ServerConfig{Port: 8080, Host: "localhost", ReadTimeout: 30, WriteTimeout: 30},
 				ImageStore: ImageStoreConfig{TileSize: 256, DatabasePath: "./test.db"},
-				LogLevel: "invalid",
+				LogLevel:   "invalid",
 			},
 			wantErr: true,
 		},
@@ -256,7 +256,7 @@ func TestLoadConfigFromEnv(t *testing.T) {
 
 func TestJSONMarshaling(t *testing.T) {
 	config := DefaultConfig()
-	
+
 	data, err := json.Marshal(config)
 	if err != nil {
 		t.Fatalf("failed to marshal config: %v", err)
