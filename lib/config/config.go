@@ -167,7 +167,7 @@ func LoadConfigFromEnv() *Config {
 
 	// Log level from env
 	if logLevel := os.Getenv("LOG_LEVEL"); logLevel != "" {
-		config.ImageStore.DatabasePath = logLevel
+		config.LogLevel = logLevel
 	}
 
 	return config
