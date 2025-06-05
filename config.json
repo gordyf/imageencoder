@@ -6,10 +6,10 @@
     "write_timeout_seconds": 30
   },
   "image_store": {
-    "tile_size": 32,
+    "tile_size": 128,
     "similarity_threshold": 0.75,
     "database_path": "./imagestore.db",
-    "enable_delta_tiles": true
+    "enable_delta_tiles": false
   },
   "log_level": "info"
 }
