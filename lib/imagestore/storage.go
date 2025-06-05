@@ -7,10 +7,9 @@ import (
 	"image/color"
 	"log"
 	"path/filepath"
-	"time"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/klauspost/compress/zstd"
-	"go.etcd.io/bbolt"
 )
 
 var (
@@ -20,42 +19,26 @@ var (
 	featuresBucket = []byte("features")
 )
 
-// BoltImageStore implements ImageStore using BoltDB
-type BoltImageStore struct {
-	db                *bbolt.DB
+// PebbleImageStore implements ImageStore using Pebble
+type PebbleImageStore struct {
+	db                *pebble.DB
 	config            *Config
 	similarityMatcher *SimilarityMatcher
 	encoder           *zstd.Encoder
 	decoder           *zstd.Decoder
 }
 
-// NewBoltImageStore creates a new BoltDB-backed image store
-func NewBoltImageStore(config *Config) (*BoltImageStore, error) {
+// NewPebbleImageStore creates a new Pebble-backed image store
+func NewPebbleImageStore(config *Config) (*PebbleImageStore, error) {
 	// Ensure database directory exists
 	dbDir := filepath.Dir(config.DatabasePath)
 	if dbDir != "" && dbDir != "." {
 		// Create directory if it doesn't exist (simplified)
 	}
 
-	db, err := bbolt.Open(config.DatabasePath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	db, err := pebble.Open(config.DatabasePath, &pebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
-
-	// Create buckets
-	err = db.Update(func(tx *bbolt.Tx) error {
-		buckets := [][]byte{tilesBucket, deltasBucket, imagesBucket, featuresBucket}
-		for _, bucket := range buckets {
-			_, err := tx.CreateBucketIfNotExists(bucket)
-			if err != nil {
-				return fmt.Errorf("failed to create bucket %s: %w", bucket, err)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		db.Close()
-		return nil, err
 	}
 
 	// Create zstd encoder and decoder
@@ -72,7 +55,7 @@ func NewBoltImageStore(config *Config) (*BoltImageStore, error) {
 		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 	}
 
-	store := &BoltImageStore{
+	store := &PebbleImageStore{
 		db:                db,
 		config:            config,
 		similarityMatcher: NewSimilarityMatcher(),
@@ -90,7 +73,7 @@ func NewBoltImageStore(config *Config) (*BoltImageStore, error) {
 }
 
 // StoreImage stores an image using tile-based deduplication
-func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
+func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 	dedupMatch := 0
 	directStore := 0
 	deltaStore := 0
@@ -117,134 +100,53 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 		Metadata: make(map[string]string),
 	}
 
-	return s.db.Update(func(tx *bbolt.Tx) error {
-		tilesBkt := tx.Bucket(tilesBucket)
-		deltasBkt := tx.Bucket(deltasBucket)
-		imagesBkt := tx.Bucket(imagesBucket)
-		featuresBkt := tx.Bucket(featuresBucket)
+	// Use batch for atomic operations
+	batch := s.db.NewBatch()
+	defer batch.Close()
 
-		fmt.Println("considering ", len(tiles), "tiles for image", id)
+	fmt.Println("considering ", len(tiles), "tiles for image", id)
 
-		// Process each tile
-		for i, tile := range tiles {
-			tileKey := []byte(tile.ID)
+	// Process each tile
+	for i, tile := range tiles {
+		tileKey := append(tilesBucket, []byte(":"+tile.ID)...)
 
-			// Check if exact tile already exists (by hash)
-			if existing := tilesBkt.Get(tileKey); existing != nil {
-				dedupMatch++
-				// Tile already exists, just reference it
-				storedImage.TileRefs[i] = TileRef{
-					X:           tileRefs[i].X,
-					Y:           tileRefs[i].Y,
-					TileID:      tileRefs[i].TileID,
-					IsDelta:     false,
-					StorageType: StorageDuplicate,
-				}
-				continue
+		// Check if exact tile already exists (by hash)
+		if _, closer, err := s.db.Get(tileKey); err == nil {
+			closer.Close()
+			dedupMatch++
+			// Tile already exists, just reference it
+			storedImage.TileRefs[i] = TileRef{
+				X:           tileRefs[i].X,
+				Y:           tileRefs[i].Y,
+				TileID:      tileRefs[i].TileID,
+				IsDelta:     false,
+				StorageType: StorageDuplicate,
 			}
-			if existing := deltasBkt.Get(tileKey); existing != nil {
-				dedupMatch++
-				storedImage.TileRefs[i] = TileRef{
-					X:           tileRefs[i].X,
-					Y:           tileRefs[i].Y,
-					TileID:      tileRefs[i].TileID,
-					IsDelta:     false,
-					StorageType: StorageDuplicate,
-				}
-				continue
+			continue
+		}
+		deltaKey := append(deltasBucket, []byte(":"+tile.ID)...)
+		if _, closer, err := s.db.Get(deltaKey); err == nil {
+			closer.Close()
+			dedupMatch++
+			storedImage.TileRefs[i] = TileRef{
+				X:           tileRefs[i].X,
+				Y:           tileRefs[i].Y,
+				TileID:      tileRefs[i].TileID,
+				IsDelta:     false,
+				StorageType: StorageDuplicate,
 			}
+			continue
+		}
 
-			// Check if we have any tiles at all for similarity matching
-			if s.similarityMatcher.Size() == 0 {
-				directStore++
-				// No existing tiles, store this one directly (compressed)
-				compressedData, err := s.compressTileData(tile.Data)
-				if err != nil {
-					return fmt.Errorf("failed to compress tile %s: %w", tile.ID, err)
-				}
-				err = tilesBkt.Put(tileKey, compressedData)
-				if err != nil {
-					return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
-				}
-
-				// Store features
-				features, err := ExtractTileFeatures(tile.ID, tile.Data, s.config.TileSize)
-				if err == nil {
-					featuresBytes, err := json.Marshal(features)
-					if err == nil {
-						featuresBkt.Put(tileKey, featuresBytes)
-						s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
-					}
-				}
-
-				storedImage.TileRefs[i] = TileRef{
-					X:           tileRefs[i].X,
-					Y:           tileRefs[i].Y,
-					TileID:      tileRefs[i].TileID,
-					IsDelta:     false,
-					StorageType: StorageUnique,
-				}
-				continue
-			}
-
-			// Find similar tile for delta encoding (only if enabled)
-			var bestMatch *TileID
-			var err error
-			if s.config.EnableDeltaTiles {
-				bestMatch, err = s.similarityMatcher.BestMatch(
-					tile.Data,
-					s.config.TileSize,
-					func(tileID TileID) ([]byte, error) {
-						return s.getTileDataFromTx(tx, tileID)
-					},
-				)
-			}
-
-			if bestMatch == nil {
-				noBestMatch++
-			}
-
-			if s.config.EnableDeltaTiles && err == nil && bestMatch != nil {
-				// Create delta
-				baseData, err := s.getTileDataFromTx(tx, *bestMatch)
-				if err == nil {
-					deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
-					if err == nil {
-						// Only use delta if it's significantly smaller (at least 25% savings)
-						deltaIsSmaller := len(deltaData) < (len(tile.Data) * 3 / 4)
-						// debug log if delta is not smaller
-						if !deltaIsSmaller {
-							log.Printf("Delta for tile %s is not smaller than original (%d vs %d bytes)", tile.ID, len(deltaData), len(tile.Data))
-						} else {
-							deltaStore++
-							deltaKey := []byte(tile.ID)
-							tileDelta := CreateTileDelta(*bestMatch, deltaData)
-
-							deltaBytes, err := json.Marshal(tileDelta)
-							if err == nil {
-								err = deltasBkt.Put(deltaKey, deltaBytes)
-								if err == nil {
-									storedImage.TileRefs[i] = TileRef{
-										X:           tileRefs[i].X,
-										Y:           tileRefs[i].Y,
-										TileID:      tile.ID,
-										IsDelta:     true,
-										StorageType: StorageDelta,
-									}
-									continue
-								}
-							}
-						}
-					}
-				}
-			}
+		// Check if we have any tiles at all for similarity matching
+		if s.similarityMatcher.Size() == 0 {
 			directStore++
-			// Store as new tile (compressed)
+			// No existing tiles, store this one directly (compressed)
 			compressedData, err := s.compressTileData(tile.Data)
 			if err != nil {
 				return fmt.Errorf("failed to compress tile %s: %w", tile.ID, err)
 			}
-			err = tilesBkt.Put(tileKey, compressedData)
+			err = batch.Set(tileKey, compressedData, pebble.Sync)
 			if err != nil {
 				return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
 			}
@@ -254,7 +156,8 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 			if err == nil {
 				featuresBytes, err := json.Marshal(features)
 				if err == nil {
-					featuresBkt.Put(tileKey, featuresBytes)
+					featuresKey := append(featuresBucket, []byte(":"+tile.ID)...)
+					batch.Set(featuresKey, featuresBytes, pebble.Sync)
 					s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
 				}
 			}
@@ -266,33 +169,126 @@ func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
 				IsDelta:     false,
 				StorageType: StorageUnique,
 			}
+			continue
 		}
 
-		// Store image metadata
-		imageBytes, err := json.Marshal(storedImage)
-		if err != nil {
-			return fmt.Errorf("failed to marshal image metadata: %w", err)
+		// Find similar tile for delta encoding (only if enabled)
+		var bestMatch *TileID
+		var err error
+		if s.config.EnableDeltaTiles {
+			bestMatch, err = s.similarityMatcher.BestMatch(
+				tile.Data,
+				s.config.TileSize,
+				func(tileID TileID) ([]byte, error) {
+					return s.getTileData(tileID)
+				},
+			)
 		}
-		fmt.Println("Deduplication matches found:", dedupMatch)
-		fmt.Println("Direct stores:", directStore, "Delta stores:", deltaStore)
-		fmt.Println("No best matches found:", noBestMatch)
-		return imagesBkt.Put([]byte(id), imageBytes)
-	})
+
+		if bestMatch == nil {
+			noBestMatch++
+		}
+
+		if s.config.EnableDeltaTiles && err == nil && bestMatch != nil {
+			// Create delta
+			baseData, err := s.getTileData(*bestMatch)
+			if err == nil {
+				deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
+				if err == nil {
+					// Only use delta if it's significantly smaller (at least 25% savings)
+					deltaIsSmaller := len(deltaData) < (len(tile.Data) * 3 / 4)
+					// debug log if delta is not smaller
+					if !deltaIsSmaller {
+						log.Printf("Delta for tile %s is not smaller than original (%d vs %d bytes)", tile.ID, len(deltaData), len(tile.Data))
+					} else {
+						deltaStore++
+						deltaKey := append(deltasBucket, []byte(":"+tile.ID)...)
+						tileDelta := CreateTileDelta(*bestMatch, deltaData)
+
+						deltaBytes, err := json.Marshal(tileDelta)
+						if err == nil {
+							err = batch.Set(deltaKey, deltaBytes, pebble.Sync)
+							if err == nil {
+								storedImage.TileRefs[i] = TileRef{
+									X:           tileRefs[i].X,
+									Y:           tileRefs[i].Y,
+									TileID:      tile.ID,
+									IsDelta:     true,
+									StorageType: StorageDelta,
+								}
+								continue
+							}
+						}
+					}
+				}
+			}
+		}
+		directStore++
+		// Store as new tile (compressed)
+		compressedData, err := s.compressTileData(tile.Data)
+		if err != nil {
+			return fmt.Errorf("failed to compress tile %s: %w", tile.ID, err)
+		}
+		err = batch.Set(tileKey, compressedData, pebble.Sync)
+		if err != nil {
+			return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
+		}
+
+		// Store features
+		features, err := ExtractTileFeatures(tile.ID, tile.Data, s.config.TileSize)
+		if err == nil {
+			featuresBytes, err := json.Marshal(features)
+			if err == nil {
+				featuresKey := append(featuresBucket, []byte(":"+tile.ID)...)
+				batch.Set(featuresKey, featuresBytes, pebble.Sync)
+				s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
+			}
+		}
+
+		storedImage.TileRefs[i] = TileRef{
+			X:           tileRefs[i].X,
+			Y:           tileRefs[i].Y,
+			TileID:      tileRefs[i].TileID,
+			IsDelta:     false,
+			StorageType: StorageUnique,
+		}
+	}
+
+	// Store image metadata
+	imageBytes, err := json.Marshal(storedImage)
+	if err != nil {
+		return fmt.Errorf("failed to marshal image metadata: %w", err)
+	}
+	imageKey := append(imagesBucket, []byte(":"+id)...)
+	err = batch.Set(imageKey, imageBytes, pebble.Sync)
+	if err != nil {
+		return fmt.Errorf("failed to store image metadata: %w", err)
+	}
+
+	// Commit the batch
+	err = batch.Commit(pebble.Sync)
+	if err != nil {
+		return fmt.Errorf("failed to commit batch: %w", err)
+	}
+
+	fmt.Println("Deduplication matches found:", dedupMatch)
+	fmt.Println("Direct stores:", directStore, "Delta stores:", deltaStore)
+	fmt.Println("No best matches found:", noBestMatch)
+	return nil
 }
 
 // RetrieveImage reconstructs and returns an image
-func (s *BoltImageStore) RetrieveImage(id string) ([]byte, error) {
+func (s *PebbleImageStore) RetrieveImage(id string) ([]byte, error) {
 	var storedImage StoredImage
 
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		imagesBkt := tx.Bucket(imagesBucket)
-		imageData := imagesBkt.Get([]byte(id))
-		if imageData == nil {
-			return fmt.Errorf("image not found: %s", id)
-		}
+	imageKey := append(imagesBucket, []byte(":"+id)...)
+	imageData, closer, err := s.db.Get(imageKey)
+	if err != nil {
+		return nil, fmt.Errorf("image not found: %s", id)
+	}
+	defer closer.Close()
 
-		return json.Unmarshal(imageData, &storedImage)
-	})
+	err = json.Unmarshal(imageData, &storedImage)
 	if err != nil {
 		return nil, err
 	}
@@ -310,100 +306,125 @@ func (s *BoltImageStore) RetrieveImage(id string) ([]byte, error) {
 }
 
 // DeleteImage removes an image and unreferenced tiles
-func (s *BoltImageStore) DeleteImage(id string) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
-		imagesBkt := tx.Bucket(imagesBucket)
-		imageData := imagesBkt.Get([]byte(id))
-		if imageData == nil {
-			return fmt.Errorf("image not found: %s", id)
-		}
+func (s *PebbleImageStore) DeleteImage(id string) error {
+	imageKey := append(imagesBucket, []byte(":"+id)...)
+	imageData, closer, err := s.db.Get(imageKey)
+	if err != nil {
+		return fmt.Errorf("image not found: %s", id)
+	}
+	defer closer.Close()
 
-		var storedImage StoredImage
-		err := json.Unmarshal(imageData, &storedImage)
-		if err != nil {
-			return fmt.Errorf("failed to unmarshal image: %w", err)
-		}
+	var storedImage StoredImage
+	err = json.Unmarshal(imageData, &storedImage)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal image: %w", err)
+	}
 
-		// Delete image metadata
-		err = imagesBkt.Delete([]byte(id))
-		if err != nil {
-			return err
-		}
+	// Delete image metadata
+	err = s.db.Delete(imageKey, pebble.Sync)
+	if err != nil {
+		return err
+	}
 
-		// TODO: Implement reference counting to delete unreferenced tiles
-		// For now, we keep tiles to avoid complexity
+	// TODO: Implement reference counting to delete unreferenced tiles
+	// For now, we keep tiles to avoid complexity
 
-		return nil
-	})
+	return nil
 }
 
 // ListImages returns all stored image IDs
-func (s *BoltImageStore) ListImages() ([]string, error) {
+func (s *PebbleImageStore) ListImages() ([]string, error) {
 	var imageIDs []string
 
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		imagesBkt := tx.Bucket(imagesBucket)
-		return imagesBkt.ForEach(func(k, v []byte) error {
-			imageIDs = append(imageIDs, string(k))
-			return nil
-		})
+	// Create iterator for images bucket
+	prefix := append(imagesBucket, byte(':'))
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: append(prefix, 0xFF),
 	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
 
-	return imageIDs, err
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		// Extract ID from key (remove bucket prefix and ":")
+		id := string(key[len(prefix):])
+		imageIDs = append(imageIDs, id)
+	}
+
+	return imageIDs, iter.Error()
 }
 
 // GetStorageStats returns storage statistics
-func (s *BoltImageStore) GetStorageStats() StorageStats {
+func (s *PebbleImageStore) GetStorageStats() StorageStats {
 	var stats StorageStats
 
-	s.db.View(func(tx *bbolt.Tx) error {
-		imagesBkt := tx.Bucket(imagesBucket)
-		tilesBkt := tx.Bucket(tilesBucket)
-		deltasBkt := tx.Bucket(deltasBucket)
-
-		// Count images and analyze tile usage patterns
-		imagesBkt.ForEach(func(k, v []byte) error {
-			stats.TotalImages++
-
-			var storedImage StoredImage
-			err := json.Unmarshal(v, &storedImage)
-			if err == nil {
-				// Count tiles by storage type
-				for _, tileRef := range storedImage.TileRefs {
-					stats.TotalTiles++
-					switch tileRef.StorageType {
-					case StorageUnique:
-						stats.DirectTiles++
-					case StorageDuplicate:
-						stats.DeduplicatedTiles++
-					case StorageDelta:
-						stats.DeduplicatedTiles++
-					}
-				}
-
-				// Calculate original uncompressed size for this image
-				totalPixels := int64(storedImage.Width * storedImage.Height)
-				stats.OriginalBytes += totalPixels * 3 // 3 bytes per pixel (RGB)
-			}
-			return nil
-		})
-
-		// Count unique tiles and their storage size
-		tilesBkt.ForEach(func(k, v []byte) error {
-			stats.UniqueTiles++
-			stats.StorageBytes += int64(len(v))
-			return nil
-		})
-
-		// Count deltas and their storage size
-		deltasBkt.ForEach(func(k, v []byte) error {
-			stats.TotalDeltas++
-			stats.StorageBytes += int64(len(v))
-			return nil
-		})
-
-		return nil
+	// Count images and analyze tile usage patterns
+	imagesPrefix := append(imagesBucket, byte(':'))
+	imagesIter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: imagesPrefix,
+		UpperBound: append(imagesPrefix, 0xFF),
 	})
+	if err != nil {
+		return stats
+	}
+	defer imagesIter.Close()
+
+	for imagesIter.First(); imagesIter.Valid(); imagesIter.Next() {
+		stats.TotalImages++
+
+		var storedImage StoredImage
+		err := json.Unmarshal(imagesIter.Value(), &storedImage)
+		if err == nil {
+			// Count tiles by storage type
+			for _, tileRef := range storedImage.TileRefs {
+				stats.TotalTiles++
+				switch tileRef.StorageType {
+				case StorageUnique:
+					stats.DirectTiles++
+				case StorageDuplicate:
+					stats.DeduplicatedTiles++
+				case StorageDelta:
+					stats.DeduplicatedTiles++
+				}
+			}
+
+			// Calculate original uncompressed size for this image
+			totalPixels := int64(storedImage.Width * storedImage.Height)
+			stats.OriginalBytes += totalPixels * 3 // 3 bytes per pixel (RGB)
+		}
+	}
+
+	// Count unique tiles and their storage size
+	tilesPrefix := append(tilesBucket, byte(':'))
+	tilesIter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: tilesPrefix,
+		UpperBound: append(tilesPrefix, 0xFF),
+	})
+	if err == nil {
+		defer tilesIter.Close()
+		for tilesIter.First(); tilesIter.Valid(); tilesIter.Next() {
+			stats.UniqueTiles++
+			stats.StorageBytes += int64(len(tilesIter.Value()))
+		}
+	}
+
+	// Count deltas and their storage size
+	deltasPrefix := append(deltasBucket, byte(':'))
+	deltasIter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: deltasPrefix,
+		UpperBound: append(deltasPrefix, 0xFF),
+	})
+	if err == nil {
+		defer deltasIter.Close()
+		for deltasIter.First(); deltasIter.Valid(); deltasIter.Next() {
+			stats.TotalDeltas++
+			stats.StorageBytes += int64(len(deltasIter.Value()))
+		}
+	}
+
 
 	// Calculate percentages
 	if stats.TotalTiles > 0 {
@@ -420,7 +441,7 @@ func (s *BoltImageStore) GetStorageStats() StorageStats {
 }
 
 // Close closes the database
-func (s *BoltImageStore) Close() error {
+func (s *PebbleImageStore) Close() error {
 	if s.encoder != nil {
 		s.encoder.Close()
 	}
@@ -431,7 +452,7 @@ func (s *BoltImageStore) Close() error {
 }
 
 // compressTileData compresses tile data using PNG
-func (s *BoltImageStore) compressTileData(data []byte) ([]byte, error) {
+func (s *PebbleImageStore) compressTileData(data []byte) ([]byte, error) {
 	// Convert raw RGB data to image.RGBA
 	img := image.NewRGBA(image.Rect(0, 0, s.config.TileSize, s.config.TileSize))
 
@@ -456,7 +477,7 @@ func (s *BoltImageStore) compressTileData(data []byte) ([]byte, error) {
 }
 
 // decompressTileData decompresses tile data from PNG
-func (s *BoltImageStore) decompressTileData(compressedData []byte) ([]byte, error) {
+func (s *PebbleImageStore) decompressTileData(compressedData []byte) ([]byte, error) {
 	// Decode PNG image
 	img, err := decodeImageFromBytes(compressedData)
 	if err != nil {
@@ -494,18 +515,17 @@ func (s *BoltImageStore) decompressTileData(compressedData []byte) ([]byte, erro
 }
 
 // RetrieveDebugImage generates a color-coded debug visualization
-func (s *BoltImageStore) RetrieveDebugImage(id string) ([]byte, error) {
+func (s *PebbleImageStore) RetrieveDebugImage(id string) ([]byte, error) {
 	var storedImage StoredImage
 
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		imagesBkt := tx.Bucket(imagesBucket)
-		imageData := imagesBkt.Get([]byte(id))
-		if imageData == nil {
-			return fmt.Errorf("image not found: %s", id)
-		}
+	imageKey := append(imagesBucket, []byte(":"+id)...)
+	imageData, closer, err := s.db.Get(imageKey)
+	if err != nil {
+		return nil, fmt.Errorf("image not found: %s", id)
+	}
+	defer closer.Close()
 
-		return json.Unmarshal(imageData, &storedImage)
-	})
+	err = json.Unmarshal(imageData, &storedImage)
 	if err != nil {
 		return nil, err
 	}
@@ -569,25 +589,12 @@ func (s *BoltImageStore) RetrieveDebugImage(id string) ([]byte, error) {
 }
 
 // getTileData retrieves tile data by ID
-func (s *BoltImageStore) getTileData(tileID TileID) ([]byte, error) {
-	var data []byte
-
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		var err error
-		data, err = s.getTileDataFromTx(tx, tileID)
-		return err
-	})
-
-	return data, err
-}
-
-// getTileDataFromTx retrieves tile data within a transaction
-func (s *BoltImageStore) getTileDataFromTx(tx *bbolt.Tx, tileID TileID) ([]byte, error) {
-	tileKey := []byte(tileID)
+func (s *PebbleImageStore) getTileData(tileID TileID) ([]byte, error) {
+	tileKey := append(tilesBucket, []byte(":"+string(tileID))...)
 
 	// Try tiles bucket first
-	tilesBkt := tx.Bucket(tilesBucket)
-	if compressedData := tilesBkt.Get(tileKey); compressedData != nil {
+	if compressedData, closer, err := s.db.Get(tileKey); err == nil {
+		defer closer.Close()
 		// Decompress the tile data
 		decompressedData, err := s.decompressTileData(compressedData)
 		if err != nil {
@@ -597,8 +604,9 @@ func (s *BoltImageStore) getTileDataFromTx(tx *bbolt.Tx, tileID TileID) ([]byte,
 	}
 
 	// Try deltas bucket
-	deltasBkt := tx.Bucket(deltasBucket)
-	if deltaData := deltasBkt.Get(tileKey); deltaData != nil {
+	deltaKey := append(deltasBucket, []byte(":"+string(tileID))...)
+	if deltaData, closer, err := s.db.Get(deltaKey); err == nil {
+		defer closer.Close()
 		var tileDelta TileDelta
 		err := json.Unmarshal(deltaData, &tileDelta)
 		if err != nil {
@@ -606,7 +614,7 @@ func (s *BoltImageStore) getTileDataFromTx(tx *bbolt.Tx, tileID TileID) ([]byte,
 		}
 
 		// Get base tile
-		baseData, err := s.getTileDataFromTx(tx, tileDelta.BaseID)
+		baseData, err := s.getTileData(tileDelta.BaseID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get base tile %s: %w", tileDelta.BaseID, err)
 		}
@@ -618,22 +626,30 @@ func (s *BoltImageStore) getTileDataFromTx(tx *bbolt.Tx, tileID TileID) ([]byte,
 	return nil, fmt.Errorf("tile not found: %s", tileID)
 }
 
+
 // loadFeatures loads existing tile features into the similarity matcher
-func (s *BoltImageStore) loadFeatures() error {
-	return s.db.View(func(tx *bbolt.Tx) error {
-		featuresBkt := tx.Bucket(featuresBucket)
-
-		return featuresBkt.ForEach(func(k, v []byte) error {
-			var features TileFeatures
-			err := json.Unmarshal(v, &features)
-			if err != nil {
-				log.Printf("Warning: failed to unmarshal features for tile %s: %v", k, err)
-				return nil // Continue with other features
-			}
-
-			// Add to similarity matcher (we don't need the actual tile data here)
-			s.similarityMatcher.features = append(s.similarityMatcher.features, features)
-			return nil
-		})
+func (s *PebbleImageStore) loadFeatures() error {
+	featuresPrefix := append(featuresBucket, byte(':'))
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: featuresPrefix,
+		UpperBound: append(featuresPrefix, 0xFF),
 	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var features TileFeatures
+		err := json.Unmarshal(iter.Value(), &features)
+		if err != nil {
+			log.Printf("Warning: failed to unmarshal features for tile %s: %v", iter.Key(), err)
+			continue // Continue with other features
+		}
+
+		// Add to similarity matcher (we don't need the actual tile data here)
+		s.similarityMatcher.features = append(s.similarityMatcher.features, features)
+	}
+
+	return iter.Error()
 }

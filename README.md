@@ -9,7 +9,7 @@ A Go library and HTTP service for efficient storage of similar images using tile
 - **Content-addressed storage**: Unique tiles stored once using SHA-256 hashing
 - **HTTP API**: RESTful API for storing, retrieving, and managing images
 - **Sub-linear storage growth**: Efficient storage for collections of similar images
-- **BoltDB backend**: Embedded database for persistence
+- **Pebble backend**: High-performance embedded database for persistence
 
 ## Quick Start
 
@@ -131,7 +131,7 @@ You can configure the server using environment variables:
 
 ### Storage Layout
 
-The system uses BoltDB with the following buckets:
+The system uses Pebble with the following key prefixes:
 - `tiles` - Unique tile data indexed by tile ID
 - `deltas` - Delta data for similar tiles
 - `images` - Image metadata and tile references
@@ -155,7 +155,7 @@ lib/
     tiles.go              - Tile extraction/reconstruction
     delta.go              - Delta computation and encoding
     similarity.go         - Tile similarity matching
-    storage.go            - BoltDB persistence layer
+    storage.go            - Pebble persistence layer
   config/config.go        - Configuration management
 internal/
   handlers/http.go        - HTTP request handlers
@@ -176,7 +176,7 @@ import (
 func main() {
     // Create store
     config := imagestore.DefaultConfig()
-    store, err := imagestore.NewBoltImageStore(config)
+    store, err := imagestore.NewPebbleImageStore(config)
     if err != nil {
         panic(err)
     }
