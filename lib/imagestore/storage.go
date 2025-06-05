@@ -1,0 +1,364 @@
+package imagestore
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"path/filepath"
+	"time"
+
+	"go.etcd.io/bbolt"
+)
+
+var (
+	tilesBucket    = []byte("tiles")
+	deltasBucket   = []byte("deltas")
+	imagesBucket   = []byte("images")
+	featuresBucket = []byte("features")
+)
+
+// BoltImageStore implements ImageStore using BoltDB
+type BoltImageStore struct {
+	db               *bbolt.DB
+	config           *Config
+	similarityMatcher *SimilarityMatcher
+}
+
+// NewBoltImageStore creates a new BoltDB-backed image store
+func NewBoltImageStore(config *Config) (*BoltImageStore, error) {
+	// Ensure database directory exists
+	dbDir := filepath.Dir(config.DatabasePath)
+	if dbDir != "" && dbDir != "." {
+		// Create directory if it doesn't exist (simplified)
+	}
+	
+	db, err := bbolt.Open(config.DatabasePath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	
+	// Create buckets
+	err = db.Update(func(tx *bbolt.Tx) error {
+		buckets := [][]byte{tilesBucket, deltasBucket, imagesBucket, featuresBucket}
+		for _, bucket := range buckets {
+			_, err := tx.CreateBucketIfNotExists(bucket)
+			if err != nil {
+				return fmt.Errorf("failed to create bucket %s: %w", bucket, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	
+	store := &BoltImageStore{
+		db:               db,
+		config:           config,
+		similarityMatcher: NewSimilarityMatcher(),
+	}
+	
+	// Load existing features into similarity matcher
+	err = store.loadFeatures()
+	if err != nil {
+		log.Printf("Warning: failed to load features: %v", err)
+	}
+	
+	return store, nil
+}
+
+// StoreImage stores an image using tile-based deduplication
+func (s *BoltImageStore) StoreImage(id string, imageData []byte) error {
+	// Convert image data to image.Image
+	img, err := decodeImageFromBytes(imageData)
+	if err != nil {
+		return fmt.Errorf("failed to decode image: %w", err)
+	}
+	
+	// Extract tiles
+	tiles, tileRefs, err := ExtractTiles(img, s.config.TileSize)
+	if err != nil {
+		return fmt.Errorf("failed to extract tiles: %w", err)
+	}
+	
+	bounds := img.Bounds()
+	storedImage := &StoredImage{
+		ID:       id,
+		Width:    bounds.Dx(),
+		Height:   bounds.Dy(),
+		TileRefs: make([]TileRef, len(tileRefs)),
+		Metadata: make(map[string]string),
+	}
+	
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		tilesBkt := tx.Bucket(tilesBucket)
+		deltasBkt := tx.Bucket(deltasBucket)
+		imagesBkt := tx.Bucket(imagesBucket)
+		featuresBkt := tx.Bucket(featuresBucket)
+		
+		// Process each tile
+		for i, tile := range tiles {
+			tileKey := []byte(tile.ID)
+			
+			// Check if tile already exists
+			if existing := tilesBkt.Get(tileKey); existing != nil {
+				// Tile already exists, just reference it
+				storedImage.TileRefs[i] = tileRefs[i]
+				continue
+			}
+			
+			// Find similar tile for delta encoding
+			bestMatch, _, err := s.similarityMatcher.BestMatchWithPixelCheck(
+				tile.Data,
+				s.config.TileSize,
+				0.3, // Feature threshold
+				s.config.SimilarityThreshold,
+				func(tileID TileID) ([]byte, error) {
+					return s.getTileDataFromTx(tx, tileID)
+				},
+			)
+			
+			if err == nil && bestMatch != nil {
+				// Create delta
+				baseData, err := s.getTileDataFromTx(tx, *bestMatch)
+				if err == nil {
+					deltaData, err := ComputeDelta(tile.Data, baseData, s.config.TileSize)
+					if err == nil {
+						// Store as delta if it's smaller than the original tile
+						if len(deltaData) < len(tile.Data) {
+							deltaKey := []byte(tile.ID)
+							tileDelta := CreateTileDelta(*bestMatch, deltaData)
+							
+							deltaBytes, err := json.Marshal(tileDelta)
+							if err == nil {
+								err = deltasBkt.Put(deltaKey, deltaBytes)
+								if err == nil {
+									storedImage.TileRefs[i] = TileRef{
+										X:       tileRefs[i].X,
+										Y:       tileRefs[i].Y,
+										TileID:  tile.ID,
+										IsDelta: true,
+									}
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+			
+			// Store as new tile
+			err = tilesBkt.Put(tileKey, tile.Data)
+			if err != nil {
+				return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
+			}
+			
+			// Store features
+			features, err := ExtractTileFeatures(tile.ID, tile.Data, s.config.TileSize)
+			if err == nil {
+				featuresBytes, err := json.Marshal(features)
+				if err == nil {
+					featuresBkt.Put(tileKey, featuresBytes)
+					s.similarityMatcher.AddTile(tile.ID, tile.Data, s.config.TileSize)
+				}
+			}
+			
+			storedImage.TileRefs[i] = tileRefs[i]
+		}
+		
+		// Store image metadata
+		imageBytes, err := json.Marshal(storedImage)
+		if err != nil {
+			return fmt.Errorf("failed to marshal image metadata: %w", err)
+		}
+		
+		return imagesBkt.Put([]byte(id), imageBytes)
+	})
+}
+
+// RetrieveImage reconstructs and returns an image
+func (s *BoltImageStore) RetrieveImage(id string) ([]byte, error) {
+	var storedImage StoredImage
+	
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		imagesBkt := tx.Bucket(imagesBucket)
+		imageData := imagesBkt.Get([]byte(id))
+		if imageData == nil {
+			return fmt.Errorf("image not found: %s", id)
+		}
+		
+		return json.Unmarshal(imageData, &storedImage)
+	})
+	if err != nil {
+		return nil, err
+	}
+	
+	// Reconstruct image
+	img, err := ReconstructImage(&storedImage, s.config.TileSize, func(tileID TileID) ([]byte, error) {
+		return s.getTileData(tileID)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to reconstruct image: %w", err)
+	}
+	
+	// Encode to PNG
+	return encodeImageToPNG(img)
+}
+
+// DeleteImage removes an image and unreferenced tiles
+func (s *BoltImageStore) DeleteImage(id string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		imagesBkt := tx.Bucket(imagesBucket)
+		imageData := imagesBkt.Get([]byte(id))
+		if imageData == nil {
+			return fmt.Errorf("image not found: %s", id)
+		}
+		
+		var storedImage StoredImage
+		err := json.Unmarshal(imageData, &storedImage)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal image: %w", err)
+		}
+		
+		// Delete image metadata
+		err = imagesBkt.Delete([]byte(id))
+		if err != nil {
+			return err
+		}
+		
+		// TODO: Implement reference counting to delete unreferenced tiles
+		// For now, we keep tiles to avoid complexity
+		
+		return nil
+	})
+}
+
+// ListImages returns all stored image IDs
+func (s *BoltImageStore) ListImages() ([]string, error) {
+	var imageIDs []string
+	
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		imagesBkt := tx.Bucket(imagesBucket)
+		return imagesBkt.ForEach(func(k, v []byte) error {
+			imageIDs = append(imageIDs, string(k))
+			return nil
+		})
+	})
+	
+	return imageIDs, err
+}
+
+// GetStorageStats returns storage statistics
+func (s *BoltImageStore) GetStorageStats() StorageStats {
+	var stats StorageStats
+	
+	s.db.View(func(tx *bbolt.Tx) error {
+		// Count images
+		imagesBkt := tx.Bucket(imagesBucket)
+		imagesBkt.ForEach(func(k, v []byte) error {
+			stats.TotalImages++
+			return nil
+		})
+		
+		// Count tiles
+		tilesBkt := tx.Bucket(tilesBucket)
+		tilesBkt.ForEach(func(k, v []byte) error {
+			stats.UniqueTiles++
+			stats.StorageBytes += int64(len(v))
+			return nil
+		})
+		
+		// Count deltas
+		deltasBkt := tx.Bucket(deltasBucket)
+		deltasBkt.ForEach(func(k, v []byte) error {
+			stats.TotalDeltas++
+			stats.StorageBytes += int64(len(v))
+			return nil
+		})
+		
+		return nil
+	})
+	
+	// Calculate compression ratio (simplified)
+	if stats.TotalImages > 0 {
+		expectedSize := int64(stats.TotalImages) * int64(s.config.TileSize*s.config.TileSize*3)
+		if expectedSize > 0 {
+			stats.CompressionRatio = float64(expectedSize) / float64(stats.StorageBytes)
+		}
+	}
+	
+	return stats
+}
+
+// Close closes the database
+func (s *BoltImageStore) Close() error {
+	return s.db.Close()
+}
+
+// getTileData retrieves tile data by ID
+func (s *BoltImageStore) getTileData(tileID TileID) ([]byte, error) {
+	var data []byte
+	
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		var err error
+		data, err = s.getTileDataFromTx(tx, tileID)
+		return err
+	})
+	
+	return data, err
+}
+
+// getTileDataFromTx retrieves tile data within a transaction
+func (s *BoltImageStore) getTileDataFromTx(tx *bbolt.Tx, tileID TileID) ([]byte, error) {
+	tileKey := []byte(tileID)
+	
+	// Try tiles bucket first
+	tilesBkt := tx.Bucket(tilesBucket)
+	if tileData := tilesBkt.Get(tileKey); tileData != nil {
+		result := make([]byte, len(tileData))
+		copy(result, tileData)
+		return result, nil
+	}
+	
+	// Try deltas bucket
+	deltasBkt := tx.Bucket(deltasBucket)
+	if deltaData := deltasBkt.Get(tileKey); deltaData != nil {
+		var tileDelta TileDelta
+		err := json.Unmarshal(deltaData, &tileDelta)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal delta: %w", err)
+		}
+		
+		// Get base tile
+		baseData, err := s.getTileDataFromTx(tx, tileDelta.BaseID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get base tile %s: %w", tileDelta.BaseID, err)
+		}
+		
+		// Apply delta
+		return ApplyDelta(baseData, tileDelta.Delta, s.config.TileSize)
+	}
+	
+	return nil, fmt.Errorf("tile not found: %s", tileID)
+}
+
+// loadFeatures loads existing tile features into the similarity matcher
+func (s *BoltImageStore) loadFeatures() error {
+	return s.db.View(func(tx *bbolt.Tx) error {
+		featuresBkt := tx.Bucket(featuresBucket)
+		
+		return featuresBkt.ForEach(func(k, v []byte) error {
+			var features TileFeatures
+			err := json.Unmarshal(v, &features)
+			if err != nil {
+				log.Printf("Warning: failed to unmarshal features for tile %s: %v", k, err)
+				return nil // Continue with other features
+			}
+			
+			// Add to similarity matcher (we don't need the actual tile data here)
+			s.similarityMatcher.features = append(s.similarityMatcher.features, features)
+			return nil
+		})
+	})
+}

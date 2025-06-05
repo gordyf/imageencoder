@@ -1,3 +1,7 @@
 module github.com/gordyf/imageencoder
 
-go 1.24.3
+go 1.21
+
+require go.etcd.io/bbolt v1.3.8
+
+require golang.org/x/sys v0.4.0 // indirect

@@ -1,0 +1,14 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "localhost",
+    "read_timeout_seconds": 30,
+    "write_timeout_seconds": 30
+  },
+  "image_store": {
+    "tile_size": 256,
+    "similarity_threshold": 0.1,
+    "database_path": "./imagestore.db"
+  },
+  "log_level": "info"
+}
