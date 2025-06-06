@@ -21,6 +21,7 @@ go.work
 server
 imageencoder
 cmd/server/server
+dictionary
 
 # Database files
 *.db

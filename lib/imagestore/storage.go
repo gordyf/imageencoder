@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"os"
 	"path/filepath"
 
 	"github.com/DataDog/zstd"
@@ -44,7 +45,16 @@ func NewPebbleImageStore(config *Config) (*PebbleImageStore, error) {
 	// Ensure database directory exists
 	dbDir := filepath.Dir(config.DatabasePath)
 	if dbDir != "" && dbDir != "." {
-		// Create directory if it doesn't exist (simplified)
+		if err := os.MkdirAll(dbDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create database directory: %w", err)
+		}
+	}
+
+	// Ensure tile dump directory exists if specified
+	if config.TileDumpDir != "" {
+		if err := os.MkdirAll(config.TileDumpDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create tile dump directory: %w", err)
+		}
 	}
 
 	db, err := pebble.Open(config.DatabasePath, &pebble.Options{})
@@ -140,6 +150,15 @@ func (s *PebbleImageStore) StoreImage(id string, imageData []byte) error {
 		err = batch.Set(tileKey, compressedData, pebble.Sync)
 		if err != nil {
 			return fmt.Errorf("failed to store tile %s: %w", tile.ID, err)
+		}
+
+		// Optionally dump uncompressed tile to disk for dictionary training
+		if s.config.TileDumpDir != "" {
+			err = s.dumpTileToFile(tile.ID, tile.Data)
+			if err != nil {
+				// Log error but don't fail the entire operation
+				fmt.Printf("Warning: failed to dump tile %s to file: %v\n", tile.ID, err)
+			}
 		}
 
 		storedImage.TileRefs[i] = TileRef{
@@ -439,4 +458,10 @@ func (s *PebbleImageStore) getTileData(tileID TileID) ([]byte, error) {
 	}
 
 	return nil, fmt.Errorf("tile not found: %s", tileID)
+}
+
+// dumpTileToFile writes uncompressed tile data to a file for zstd dictionary training
+func (s *PebbleImageStore) dumpTileToFile(tileID TileID, data []byte) error {
+	filename := filepath.Join(s.config.TileDumpDir, string(tileID)+".tile")
+	return os.WriteFile(filename, data, 0644)
 }
