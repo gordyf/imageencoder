@@ -6,7 +6,7 @@
     "write_timeout_seconds": 30
   },
   "image_store": {
-    "tile_size": 128,
+    "tile_size": 256,
     "database_path": "./imagestore.db"
   },
   "log_level": "info"

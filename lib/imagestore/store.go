@@ -83,6 +83,7 @@ type Config struct {
 	SimilarityThreshold float64 // Default 0.1 (10% difference threshold)
 	DatabasePath        string
 	TileDumpDir         string  // Optional: directory to dump uncompressed tiles for zstd dictionary training
+	DictPath            string  // Optional: path to zstd dictionary file for compression
 }
 
 func DefaultConfig() *Config {

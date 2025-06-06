@@ -1,10 +1,12 @@
 package imagestore
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -38,6 +40,7 @@ func makePrefixKey(bucket []byte) []byte {
 type PebbleImageStore struct {
 	db     *pebble.DB
 	config *Config
+	dict   []byte // Optional zstd dictionary
 }
 
 // NewPebbleImageStore creates a new Pebble-backed image store
@@ -57,6 +60,16 @@ func NewPebbleImageStore(config *Config) (*PebbleImageStore, error) {
 		}
 	}
 
+	// Load zstd dictionary if specified
+	var dict []byte
+	if config.DictPath != "" {
+		dictData, err := os.ReadFile(config.DictPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load zstd dictionary from %s: %w", config.DictPath, err)
+		}
+		dict = dictData
+	}
+
 	db, err := pebble.Open(config.DatabasePath, &pebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -65,6 +78,7 @@ func NewPebbleImageStore(config *Config) (*PebbleImageStore, error) {
 	store := &PebbleImageStore{
 		db:     db,
 		config: config,
+		dict:   dict,
 	}
 
 	return store, nil
@@ -348,16 +362,45 @@ func (s *PebbleImageStore) compressTileData(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invalid tile data size: expected %d, got %d", expectedSize, len(data))
 	}
 
-	// Compress using zstd
+	// Compress using zstd with optional dictionary
+	if s.dict != nil {
+		var buf bytes.Buffer
+		writer := zstd.NewWriterLevelDict(&buf, zstd.BestSpeed, s.dict)
+		
+		_, err := writer.Write(data)
+		if err != nil {
+			writer.Close()
+			return nil, fmt.Errorf("failed to write data to zstd writer: %w", err)
+		}
+		
+		err = writer.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to close zstd writer: %w", err)
+		}
+		
+		return buf.Bytes(), nil
+	}
 	return zstd.Compress(nil, data)
 }
 
 // decompressTileData decompresses tile data from zstd
 func (s *PebbleImageStore) decompressTileData(compressedData []byte) ([]byte, error) {
-	// Decompress using zstd
-	data, err := zstd.Decompress(nil, compressedData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress zstd tile: %w", err)
+	// Decompress using zstd with optional dictionary
+	var data []byte
+	var err error
+	if s.dict != nil {
+		reader := zstd.NewReaderDict(bytes.NewReader(compressedData), s.dict)
+		defer reader.Close()
+		
+		data, err = io.ReadAll(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read from zstd reader: %w", err)
+		}
+	} else {
+		data, err = zstd.Decompress(nil, compressedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress zstd tile: %w", err)
+		}
 	}
 
 	// Validate tile data size
